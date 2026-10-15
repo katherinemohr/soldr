@@ -1,13 +1,16 @@
 from ortools.sat.python import cp_model
 
 # ISL, OSL, arrival, hash_ids
-trace = [(2, 2, 0, [0]), (4, 10, 1, [0])]
+trace = [(2000, 200, 0, [0]), (20000, 100, 1, [0])]
 
-cap = 20
+# Approximate 200 prefill tokens ~ 1 decode token = 1 timestep
+prefill_latency = lambda ctx: max(1, ctx // 200)
+
+cap = 50000
 assert cap >= max([req[0] + req[1] for req in trace])
 
-horizon = 20
-assert horizon > sorted(map(lambda req: int(req[0] > 0) + req[1] + req[2], trace))[-1]
+horizon = 50000
+assert horizon > sorted(map(lambda req: prefill_latency(req[0]) + req[1] + req[2], trace))[-1]
 
 model = cp_model.CpModel()
 
@@ -34,7 +37,7 @@ intervals = []
 sizes = []
 for idx, req in enumerate(trace):
     # Cache hit means entire prefill is skipped
-    duration = int(req[0] > 0) * (1 - cache_hit[idx]) + req[1]
+    duration = prefill_latency(req[0]) * (1 - cache_hit[idx]) + req[1]
     interval = model.NewIntervalVar(starts[idx], duration, ends[idx], f"interval[{idx}]")
     intervals.append(interval)
     sizes.append(req[0] + req[1])
