@@ -21,7 +21,7 @@ def saving(r1, r2):
             break
         count += 1
     saved_toks = min(count * BLK_SIZE, r1[0], r2[0])
-    return prefill_latency(saved_toks)
+    return prefill_latency(r2[0]) - prefill_latency(r2[0] - saved_toks)
 
 mem = 50000
 assert mem >= max([req[0] + req[1] for req in trace])
@@ -34,7 +34,7 @@ model = cp_model.CpModel()
 starts = [model.NewIntVar(req[2], horizon, f"start[{idx}]") for idx, req in enumerate(trace)]
 ends = [model.NewIntVar(req[2], horizon, f"end[{idx}]") for idx, req in enumerate(trace)]
 
-# proximal[i][j] implies starts[i] <= starts[j] <= starts[i] + CACHE_DURATION
+# proximal[i][j] implies ends[i] <= starts[j] <= ends[i] + CACHE_DURATION
 proximal = [[model.NewBoolVar(f"proximal[{i}{j}]") for j in range(len(trace))] for i in range(len(trace))]
 for i in range(len(trace)):
     for j in range(len(trace)):
@@ -42,8 +42,8 @@ for i in range(len(trace)):
             # Don't get a cache hit from yourself
             model.Add(proximal[i][j] == 0)
             continue
-        model.Add(starts[i] <= starts[j]).OnlyEnforceIf(proximal[i][j])
-        model.Add(starts[j] <= starts[i] + CACHE_DURATION).OnlyEnforceIf(proximal[i][j])
+        model.Add(ends[i] <= starts[j]).OnlyEnforceIf(proximal[i][j])
+        model.Add(starts[j] <= ends[i] + CACHE_DURATION).OnlyEnforceIf(proximal[i][j])
 
 for i in range(len(trace)):
     model.AddAtMostOne(proximal[j][i] for j in range(len(trace)))
@@ -51,13 +51,13 @@ for i in range(len(trace)):
 intervals = []
 sizes = []
 for idx in range(len(trace)):
-    # If we get a full hit, is prefill latency 0 or... 1?
-    prefill = model.NewIntVar(0, prefill_latency(trace[idx][0]), f"prefill[{idx}]")
+    # Prefill latency for a full hit is 1
+    prefill = model.NewIntVar(1, prefill_latency(trace[idx][0]), f"prefill[{idx}]")
     model.Add(prefill == prefill_latency(trace[idx][0]) - sum(proximal[i][idx] * saving(trace[i], trace[idx]) for i in range(len(trace))))
     duration = prefill + trace[idx][1]
     interval = model.NewIntervalVar(starts[idx], duration, ends[idx], f"interval[{idx}]")
     intervals.append(interval)
-    sizes.append(req[0] + req[1])
+    sizes.append(trace[idx][0] + trace[idx][1])
 
 model.AddCumulative(intervals, sizes, mem)
 
