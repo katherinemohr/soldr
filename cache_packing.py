@@ -11,14 +11,31 @@ assert horizon > sorted(map(lambda req: int(req[0] > 0) + req[1] + req[2], trace
 
 model = cp_model.CpModel()
 
-starts = []
+starts = [model.NewIntVar(req[2], horizon, f"start[{idx}]") for idx, req in enumerate(trace)]
+ends = [model.NewIntVar(req[2], horizon, f"end[{idx}]") for idx, req in enumerate(trace)]
+
+PROXIMAL = 10
+# proximal[i][j] implies starts[i] <= starts[j] <= starts[i] + PROXIMAL
+proximal = [[model.NewBoolVar(f"proximal[{i}{j}]") for j in range(len(trace))] for i in range(len(trace))]
+for i in range(len(trace)):
+    for j in range(len(trace)):
+        if i == j:
+            # Don't get a cache hit from yourself
+            model.Add(proximal[i][j] == 0)
+            continue
+        model.Add(starts[i] <= starts[j]).OnlyEnforceIf(proximal[i][j])
+        model.Add(starts[j] <= starts[i] + PROXIMAL).OnlyEnforceIf(proximal[i][j])
+
+cache_hit = [model.NewBoolVar(f"reuse[{idx}]") for idx in range(len(trace))]
+for idx, req in enumerate(trace):
+    model.Add(cache_hit[idx] <= sum(proximal[i][idx] for i in range(len(trace))))
+
 intervals = []
 sizes = []
 for idx, req in enumerate(trace):
-    start = model.NewIntVar(req[2], horizon, f"start[{idx}]")
-    duration = int(req[0] > 0) + req[1]
-    interval = model.NewIntervalVar(start, duration, start + duration, f"interval[{idx}]")
-    starts.append(start)
+    # Cache hit means entire prefill is skipped
+    duration = int(req[0] > 0) * (1 - cache_hit[idx]) + req[1]
+    interval = model.NewIntervalVar(starts[idx], duration, ends[idx], f"interval[{idx}]")
     intervals.append(interval)
     sizes.append(req[0] + req[1])
 
