@@ -3,7 +3,7 @@ from itertools import islice
 from math import ceil
 from ortools.sat.python import cp_model
 
-N = 20 # No. of requests
+N = 30 # No. of requests
 BLK_SIZE = 512 # No. of tokens per hash_id
 MEM = 250_000
 HORIZON = 100_000
@@ -94,16 +94,23 @@ for i, u in enumerate(trace):
 
 model.AddCumulative(intervals, sizes, MEM)
 
-waits = []
+# waits = []
+# for i, u in enumerate(trace):
+#     wait = model.NewIntVar(0, HORIZON, f"waits[{i}]")
+#     model.Add(wait == starts[i] - u[2])
+#     waits.append(wait)
+# model.minimize(sum(waits))
+
+ttfts = []
 for i, u in enumerate(trace):
-    wait = model.NewIntVar(0, HORIZON, f"waits[{i}]")
-    model.Add(wait == starts[i] - u[2])
-    waits.append(wait)
-model.minimize(sum(waits))
+    ttft = model.NewIntVar(0, HORIZON, f"ttft[{i}]")
+    model.Add(ttft == ends[i] - u[1] - u[2])
+    ttfts.append(ttft)
+model.minimize(sum(ttfts))
 
 solver = cp_model.CpSolver()
 status = solver.Solve(model)
 print(solver.StatusName(status))
 
-for i, u in enumerate(trace):
-    print(f"waits[{i}]= ", solver.Value(waits[i]))
+avg_ttft = sum(solver.Value(ttfts[i]) for i in range(len(trace))) / len(trace)
+print("Avg TTFT: ", avg_ttft)
