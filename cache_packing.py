@@ -1,16 +1,31 @@
+import json
+from itertools import islice
 from math import ceil
 from ortools.sat.python import cp_model
 
-BLK_SIZE = 1000 # No. of tokens per hash_id
+N = 20 # No. of requests
+BLK_SIZE = 512 # No. of tokens per hash_id
+MEM = 250_000
+HORIZON = 100_000
+
+# Approximate 800 prefill tokens ~ 1 decode token = 1 timestep
+# TODO: What is a good way to pick this?
+prefill_latency = lambda ctx: max(1, ctx // 800)
+
+# TODO: What is a good way to pick ms_per_step?
+def from_mooncake(path, n=None, ms_per_step=40):
+    with open(path) as f:
+        rows = [json.loads(line) for line in islice(f, n)]
+    t0 = rows[0]["timestamp"]
+    return [(r["input_length"], r["output_length"], (r["timestamp"] - t0) // ms_per_step, r["hash_ids"]) for r in rows]
 
 # ISL, OSL, arrival, hash_ids
-trace = [(2000, 200, 0, [0, 1]), (4000, 100, 1, [0, 3, 4, 5])]
+trace = from_mooncake("traces/mooncake_toolagent.jsonl", n=N)
 
+assert MEM >= max([u[0] + u[1] for u in trace])
+assert HORIZON > sorted(map(lambda u: prefill_latency(u[0]) + u[1] + u[2], trace))[-1]
 for u in trace:
     assert ceil(u[0] / BLK_SIZE) == len(u[3])
-
-# Approximate 200 prefill tokens ~ 1 decode token = 1 timestep
-prefill_latency = lambda ctx: max(1, ctx // 200)
 
 # Tokens in the common prefix of u and v's hash_ids
 def shared_tokens(u, v):
@@ -26,20 +41,14 @@ def saving(u, v):
     saved_toks = shared_tokens(u, v)
     return prefill_latency(v[0]) - prefill_latency(v[0] - saved_toks)
 
-mem = 50000
-assert mem >= max([u[0] + u[1] for u in trace])
-
-horizon = 50000
-assert horizon > sorted(map(lambda u: prefill_latency(u[0]) + u[1] + u[2], trace))[-1]
-
 model = cp_model.CpModel()
 
-starts = [model.NewIntVar(u[2], horizon, f"start[{i}]") for i, u in enumerate(trace)]
-ends = [model.NewIntVar(u[2], horizon, f"end[{i}]") for i, u in enumerate(trace)]
+starts = [model.NewIntVar(u[2], HORIZON, f"start[{i}]") for i, u in enumerate(trace)]
+ends = [model.NewIntVar(u[2], HORIZON, f"end[{i}]") for i, u in enumerate(trace)]
 
 # reuses[i][j] means j gets the largest possible cache hit from i.
 # TODO: Allow partial hits
-reuses = [[model.NewBoolVar(f"reuse[{i}{j}]") for j in range(len(trace))] for i in range(len(trace))]
+reuses = [[model.NewBoolVar(f"reuse[{i},{j}]") for j in range(len(trace))] for i in range(len(trace))]
 
 # Don't get a cache hit from yourself
 for i, u in enumerate(trace):
@@ -66,7 +75,7 @@ for j, v in enumerate(trace):
 
 for i, u in enumerate(trace):
     # Time at which we evict u's prompt
-    evict = model.NewIntVar(0, horizon, f"evict[{i}]")
+    evict = model.NewIntVar(0, HORIZON, f"evict[{i}]")
     model.add(evict >= ends[i])
 
     # Is u providing a cache hit to anybody?
@@ -78,16 +87,16 @@ for i, u in enumerate(trace):
         # ... and u is a provider
         model.AddImplication(reuses[i][j], is_provider)
 
-    _evict = model.NewIntVar(0, horizon, f"_evict[{i}]")
+    _evict = model.NewIntVar(0, HORIZON, f"_evict[{i}]")
     intervals.append(model.NewOptionalIntervalVar(ends[i], _evict, evict, is_provider, f"eviction[{i}]"))
     # TODO: This is an overestimate I think
     sizes.append(max(shared_tokens(u, v) for j, v in enumerate(trace) if j != i))
 
-model.AddCumulative(intervals, sizes, mem)
+model.AddCumulative(intervals, sizes, MEM)
 
 waits = []
 for i, u in enumerate(trace):
-    wait = model.NewIntVar(0, horizon, f"waits[{i}]")
+    wait = model.NewIntVar(0, HORIZON, f"waits[{i}]")
     model.Add(wait == starts[i] - u[2])
     waits.append(wait)
 model.minimize(sum(waits))
