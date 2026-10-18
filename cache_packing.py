@@ -4,9 +4,8 @@ from math import ceil
 from ortools.sat.python import cp_model
 
 C = 4 # No. of caches
-N = 30 # No. of requests
-BLK_SIZE = 512 # No. of tokens per hash_id
-MEM = 250_000
+N = 256 # No. of requests
+MEM = 1_000_000
 HORIZON = 100_000
 
 # Approximate 800 prefill tokens ~ 1 decode token = 1 timestep
@@ -18,10 +17,43 @@ def from_mooncake(path, n=None, ms_per_step=40):
     with open(path) as f:
         rows = [json.loads(line) for line in islice(f, n)]
     t0 = rows[0]["timestamp"]
-    return [(r["input_length"], r["output_length"], (r["timestamp"] - t0) // ms_per_step, r["hash_ids"]) for r in rows]
+    trace = [(r["input_length"], r["output_length"], (r["timestamp"] - t0) // ms_per_step, r["hash_ids"]) for r in rows]
+    return trace, 512
+
+def from_weka(path, lanes, n=None, ms_per_step=15, idle_cap_s=300):
+    plays = []
+    with open(path) as f:
+        for line in f:
+            play = json.loads(line)
+            # Ignore sessions with subagents
+            if all(r["type"] != "subagent" for r in play["requests"]):
+                plays.append(play)
+            if len(plays) == lanes:
+                break
+    assert len(plays) == lanes, f"only {len(plays)} plays without subagents"
+    blk_sizes = {p["block_size"] for p in plays}
+    assert len(blk_sizes) == 1
+
+    trace, offset = [], 0
+    for play in plays:
+        shift, prev_t = 0.0, 0.0
+        for r in play["requests"]:
+            idle = r["t"] - prev_t
+            # Cap the gap between successive requests from a session. This
+            # appears to be a standard transformation for Weka and helps
+            # decrease the horizon for us.
+            if idle > idle_cap_s:
+                shift += idle - idle_cap_s
+            arrival = round((r["t"] - shift) * 1000) // ms_per_step
+            trace.append((r["in"], r["out"], arrival, [h + offset for h in r["hash_ids"]]))
+            prev_t = r["t"]
+        offset += 1 + max(h for r in play["requests"] for h in r["hash_ids"])
+
+    trace.sort(key=lambda u: u[2])
+    return trace[:n], blk_sizes.pop()
 
 # (ISL, OSL, arrival, hash_ids)
-trace = from_mooncake("traces/mooncake_toolagent.jsonl", n=N)
+trace, BLK_SIZE = from_weka("traces/weka_256k.jsonl", lanes=8, n=N)
 assert len(trace) == N
 assert MEM >= max([u[0] + u[1] for u in trace])
 assert HORIZON > sorted(map(lambda u: prefill_latency(u[0]) + u[1] + u[2], trace))[-1]
@@ -140,5 +172,6 @@ if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
     avg_ttft = sum(solver.Value(ttfts[i]) for i in range(N)) / N
     print("Avg TTFT: ", avg_ttft)
 
-    obj, bound = solver.ObjectiveValue(), solver.BestObjectiveBound()
-    print(f"Objective: {obj:.0f}, bound: {bound:.0f}, gap: {(obj - bound) / max(abs(obj), 1):.1%}")
+    if status != cp_model.OPTIMAL:
+        obj, bound = solver.ObjectiveValue(), solver.BestObjectiveBound()
+        print(f"Gap: {(obj - bound) / max(abs(obj), 1):.1%}")
