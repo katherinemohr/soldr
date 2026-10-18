@@ -136,5 +136,9 @@ solver = cp_model.CpSolver()
 status = solver.Solve(model)
 print(solver.StatusName(status))
 
-avg_ttft = sum(solver.Value(ttfts[i]) for i in range(N)) / N
-print("Avg TTFT: ", avg_ttft)
+if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+    avg_ttft = sum(solver.Value(ttfts[i]) for i in range(N)) / N
+    print("Avg TTFT: ", avg_ttft)
+
+    obj, bound = solver.ObjectiveValue(), solver.BestObjectiveBound()
+    print(f"Objective: {obj:.0f}, bound: {bound:.0f}, gap: {(obj - bound) / max(abs(obj), 1):.1%}")
