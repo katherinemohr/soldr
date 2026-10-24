@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from itertools import islice
 from math import ceil
 from ortools.sat.python import cp_model
+from calibrate import MockerLatency, compare
 
 @dataclass
 class Request:
@@ -11,12 +12,9 @@ class Request:
     arrival: int
     hash_ids: list[int]
 
-# Approximate 800 prefill tokens ~ 1 decode token = 1 timestep
-# TODO: What is a good way to pick this?
-default_prefill_latency = lambda ctx: max(1, ctx // 800)
+default_latency = MockerLatency.load("mocker_params.json")
 
-# TODO: What is a good way to pick ms_per_step?
-def from_mooncake(path, n=None, ms_per_step=40):
+def from_mooncake(path, n=None, ms_per_step=default_latency.decode_ms):
     with open(path) as f:
         rows = [json.loads(line) for line in islice(f, n)]
     t0 = rows[0]["timestamp"]
@@ -52,6 +50,7 @@ def from_weka(path, lanes, n=None, ms_per_step=15, idle_cap_s=300):
             prev_t = r["t"]
         offset += 1 + max(h for r in play["requests"] for h in r["hash_ids"])
 
+    assert len(trace) >= n
     trace.sort(key=lambda u: u.arrival)
     return trace[:n], blk_sizes.pop()
 
@@ -64,11 +63,10 @@ def shared_tokens(u, v, blk_size):
     return min(count * blk_size, u.isl, v.isl)
 
 # Reduction in prefill time of v if it gets a cache hit from u
-def saving(u, v, blk_size, prefill_latency=default_prefill_latency):
-    saved_toks = shared_tokens(u, v, blk_size)
-    return prefill_latency(v.isl) - prefill_latency(v.isl - saved_toks)
+def saving(u, v, blk_size, prefill_latency=default_latency):
+    return prefill_latency(v.isl) - prefill_latency(v.isl, shared_tokens(u, v, blk_size))
 
-def build_model(trace, blk_size, num_caches=4, mem=1_000_000, horizon=100_000, prefill_latency=default_prefill_latency):
+def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     N, C = len(trace), num_caches
     assert mem >= max([u.isl + u.osl for u in trace])
     assert horizon > sorted(map(lambda u: prefill_latency(u.isl) + u.osl + u.arrival, trace))[-1]
@@ -113,14 +111,21 @@ def build_model(trace, blk_size, num_caches=4, mem=1_000_000, horizon=100_000, p
 
     intervals = [[] for c in range(C)]
     sizes = [[] for c in range(C)]
+    prefills = [[] for c in range(C)]
     for j, v in enumerate(trace):
-        # Prefill latency for a full hit is 1
+        # A full hit still recomputes the last prompt token, so it takes at least 1 step
         prefill = model.NewIntVar(1, prefill_latency(v.isl), f"prefill[{j}]")
         model.Add(prefill == prefill_latency(v.isl) - sum(reuses[i][j] * saving(u, v, blk_size, prefill_latency) for i, u in enumerate(trace)))
         duration = prefill + v.osl
+        prefill_end = model.NewIntVar(v.arrival + 1, horizon, f"prefill_end[{j}]")
+        model.Add(prefill_end == starts[j] + prefill)
         for c in range(C):
             intervals[c].append(model.NewOptionalIntervalVar(starts[j], duration, ends[j], routes[j][c], f"lifetime[{j},{c}]"))
             sizes[c].append(v.isl + v.osl)
+            prefills[c].append(model.NewOptionalIntervalVar(starts[j], prefill, prefill_end, routes[j][c], f"prefill[{j},{c}]"))
+
+    for c in range(C):
+        model.AddNoOverlap(prefills[c])
 
     for i, u in enumerate(trace):
         # Time at which we evict u's prompt
@@ -168,9 +173,14 @@ def build_model(trace, blk_size, num_caches=4, mem=1_000_000, horizon=100_000, p
 
     return model, dict(routes=routes, starts=starts, ends=ends, reuses=reuses, ttfts=ttfts)
 
+class GapLogger(cp_model.CpSolverSolutionCallback):
+    def on_solution_callback(self):
+        obj, bound = self.ObjectiveValue(), self.BestObjectiveBound()
+        print(f"[{self.WallTime():.1f}s] obj={obj:.0f} bound={bound:.0f} gap={(obj - bound) / max(abs(obj), 1):.1%}")
+
 def solve(model, vars):
     solver = cp_model.CpSolver()
-    status = solver.Solve(model)
+    status = solver.Solve(model, GapLogger())
     print(solver.StatusName(status))
 
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -184,8 +194,12 @@ def solve(model, vars):
     return solver, status
 
 if __name__ == "__main__":
-    num_requests = 128
-    trace, blk_size = from_weka("traces/weka_256k.jsonl", lanes=8, n=num_requests)
+    num_requests = 32
+    # trace, blk_size = from_weka("traces/weka_256k.jsonl", lanes=8, n=num_requests)
+    trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
     assert len(trace) == num_requests
-    model, vars = build_model(trace, blk_size, num_caches=4, mem=1_000_000, horizon=100_000)
-    solve(model, vars)
+    model, vars = build_model(trace, blk_size, num_caches=4, mem=200_000, horizon=100_000, prefill_latency=default_latency)
+    print("Built model, beginning solve...")
+    solver, status = solve(model, vars)
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        compare("traces/mooncake_conversation.jsonl", solver, vars, default_latency)

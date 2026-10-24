@@ -1,0 +1,22 @@
+# Python 3.12 (aisimulate needs >= 3.11, < 3.14):
+#     uv venv --python 3.12
+#     uv pip install -r requirements.txt --override requirements.txt \
+#         --config-settings-package "ai-dynamo-runtime:build-args=--features ais-forward-pass"
+#
+# --override makes these pins win over dependencies' own: ai-dynamo pins a Linux-only aisimulate nightly. The
+# ais-forward-pass feature lets the Mocker use AIC timing; Dynamo's own wheels are built with it.
+#
+# Dynamo (the Mocker and its KV router) and aisimulate (the Mocker's engine) have no macOS wheels, so this builds them
+# from source. That needs a Rust toolchain (https://rustup.rs) and protoc (brew install protobuf), and takes about
+# 20 minutes the first time.
+ai-dynamo @ git+https://github.com/ai-dynamo/dynamo@a83f4796b66151c0c3fd2659fbdb8b0bb9d9b341
+ai-dynamo-runtime @ git+https://github.com/ai-dynamo/dynamo@a83f4796b66151c0c3fd2659fbdb8b0bb9d9b341#subdirectory=lib/bindings/python
+# Same day as the aisimulate-core crate that Dynamo's Mocker compiles in (0.13.0-dev.202610060000000067)
+aisimulate @ git+https://github.com/ai-dynamo/aisimulate@8a709362b5f0692d263eceab4cba0a13790fe138#subdirectory=python/aisimulate
+ortools==9.15.6755
+# ortools 9.15 needs protobuf 6.33.x. grpcio-tools (pulled in by aisimulate's google-vizier) needs protobuf 7 from
+# 1.83 on, so pin it to the last release that accepts 6.33.
+protobuf==6.33.6
+grpcio-tools==1.81.1
+numpy
+pytest
