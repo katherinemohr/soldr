@@ -21,7 +21,7 @@ def from_mooncake(path, n=None, ms_per_step=default_latency.decode_ms):
     trace = [Request(r["input_length"], r["output_length"], (r["timestamp"] - t0) // ms_per_step, r["hash_ids"]) for r in rows]
     return trace, 512
 
-def from_weka(path, lanes, n=None, ms_per_step=15, idle_cap_s=300):
+def from_weka(path, lanes, n=None, ms_per_step=default_latency.decode_ms, idle_cap_s=300):
     plays = []
     with open(path) as f:
         for line in f:
@@ -113,7 +113,7 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     sizes = [[] for c in range(C)]
     prefills = [[] for c in range(C)]
     for j, v in enumerate(trace):
-        # A full hit still recomputes the last prompt token, so it takes at least 1 step
+        # Full cache hit costs 1 timestep
         prefill = model.NewIntVar(1, prefill_latency(v.isl), f"prefill[{j}]")
         model.Add(prefill == prefill_latency(v.isl) - sum(reuses[i][j] * saving(u, v, blk_size, prefill_latency) for i, u in enumerate(trace)))
         duration = prefill + v.osl
@@ -194,12 +194,12 @@ def solve(model, vars):
     return solver, status
 
 if __name__ == "__main__":
-    num_requests = 32
-    # trace, blk_size = from_weka("traces/weka_256k.jsonl", lanes=8, n=num_requests)
-    trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
+    num_requests = 256
+    trace, blk_size = from_weka("traces/weka_256k.jsonl", lanes=8, n=num_requests)
+    # trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
     assert len(trace) == num_requests
-    model, vars = build_model(trace, blk_size, num_caches=4, mem=200_000, horizon=100_000, prefill_latency=default_latency)
+    model, vars = build_model(trace, blk_size, num_caches=4, mem=16384*64, horizon=1_000_000, prefill_latency=default_latency)
     print("Built model, beginning solve...")
     solver, status = solve(model, vars)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        compare("traces/mooncake_conversation.jsonl", solver, vars, default_latency)
+        compare(trace, blk_size, solver, vars, default_latency)

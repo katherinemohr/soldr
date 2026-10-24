@@ -3,7 +3,6 @@ import os
 import tempfile
 from collections import defaultdict
 from dataclasses import asdict, dataclass, replace
-from itertools import islice
 from math import ceil
 
 import numpy as np
@@ -45,7 +44,7 @@ class MockerLatency:
         return max(1, round(self.prefill_ms(isl, hit) / self.decode_ms))
 
 
-def run_mocker(rows, workers):
+def run_mocker(rows, workers, block_size):
     os.environ.setdefault("DYN_LOG", "warn")
     from dynamo.replay import run_trace_replay
 
@@ -54,18 +53,13 @@ def run_mocker(rows, workers):
         with open(path, "w") as f:
             f.writelines(json.dumps(r) + "\n" for r in rows)
         report = run_trace_replay(path, extra_engine_args=MOCKER_ENGINE, num_workers=workers, router_mode="kv_router",
-                                  trace_block_size=512, capture_per_request=True)
+                                  trace_block_size=block_size, capture_per_request=True)
 
     key = lambda arrival, isl, osl: (round(arrival), isl, osl)
-    recs, hashes = defaultdict(list), {}
+    recs = defaultdict(list)
     for q in report.to_dict()["per_request"]:
         recs[key(q["arrival_time_ms"], q["input_length"], q["output_length"])].append(q)
-    out = []
-    for r in rows:
-        k = key(r["timestamp"] - rows[0]["timestamp"], r["input_length"], r["output_length"])
-        assert hashes.setdefault(k, r["hash_ids"]) == r["hash_ids"], "rows sharing arrival, isl and osl differ"
-        out.append(recs[k].pop())
-    return out
+    return [recs[key(r["timestamp"] - rows[0]["timestamp"], r["input_length"], r["output_length"])].pop() for r in rows]
 
 
 def soldr_ttft(rows, recs, prefill_latency):
@@ -79,24 +73,24 @@ def soldr_ttft(rows, recs, prefill_latency):
     return total / len(rows)
 
 
-def compare(path, solver, vars, prefill_latency, mocker_runs=3):
-    with open(path) as f:
-        rows = [json.loads(line) for line in islice(f, len(vars["starts"]))]
+def compare(trace, blk_size, solver, vars, prefill_latency, mocker_runs=3):
     dt = prefill_latency.decode_ms
+    rows = [{"timestamp": u.arrival * dt, "input_length": u.isl, "output_length": u.osl, "hash_ids": u.hash_ids}
+            for u in trace]
     route = [next(c for c, r in enumerate(rs) if solver.Value(r)) for rs in vars["routes"]]
-    submit = [max(r["timestamp"], rows[0]["timestamp"] + solver.Value(s) * dt) for r, s in zip(rows, vars["starts"])]
+    submit = [solver.Value(s) * dt for s in vars["starts"]]
     soldr_mocker = [0.0] * len(rows)
     for c in set(route):
         ix = sorted((j for j in range(len(rows)) if route[j] == c), key=lambda j: (submit[j], j))
-        for j, q in zip(ix, run_mocker([rows[j] | {"timestamp": submit[j]} for j in ix], workers=1)):
+        for j, q in zip(ix, run_mocker([rows[j] | {"timestamp": submit[j]} for j in ix], 1, blk_size)):
             soldr_mocker[j] = submit[j] - rows[j]["timestamp"] + q["ttft_ms"]
 
     score = lambda recs: (soldr_ttft(rows, recs, prefill_latency), sum(q["ttft_ms"] for q in recs) / len(recs) / dt)
-    mocker = [score(run_mocker(rows, len(vars["routes"][0]))) for _ in range(mocker_runs)]
+    mocker = [score(run_mocker(rows, len(vars["routes"][0]), blk_size)) for _ in range(mocker_runs)]
     soldr_soldr = sum(solver.Value(t) for t in vars["ttfts"]) / len(rows)
     table = [("Soldr decisions", soldr_soldr, sum(soldr_mocker) / len(rows) / dt),
              ("Mocker decisions", sum(s for s, _ in mocker) / mocker_runs, sum(m for _, m in mocker) / mocker_runs)]
-    print(f"{'Avg TTFT (steps)':18s} {'Soldr':>7s} {'Mocker':>7s}")
+    print(f"{'Avg TTFT':18s} {'Soldr':>7s} {'Mocker':>7s}")
     for name, soldr, mock in table:
         print(f"{name:18s} {soldr:7.1f} {mock:7.1f}")
 
@@ -113,7 +107,7 @@ def calibrate_ab():
                              "hash_ids": hashes[:hit // 512]})
             rows.append({"timestamp": 60_000 * len(rows), "input_length": isl, "output_length": 1, "hash_ids": hashes})
     x, y = [], []
-    for r, q in zip(rows, run_mocker(rows, workers=1)):
+    for r, q in zip(rows, run_mocker(rows, 1, 512)):
         new, hit = r["input_length"] - q["reused_input_tokens"], q["reused_input_tokens"]
         x.append([new, (r["input_length"] ** 2 - hit ** 2) / 2, ceil(new / chunk)])
         y.append(q["ttft_ms"])
@@ -125,7 +119,7 @@ def calibrate_ab():
 def calibrate(path, workers, out="mocker_params.json"):
     with open(path) as f:
         rows = [json.loads(line) for line in f]
-    recs = run_mocker(rows, workers)
+    recs = run_mocker(rows, workers, 512)
     target = sum(q["ttft_ms"] for q in recs) / len(recs)
     decode_ms = round(sum(q["last_token_ms"] - q["first_token_ms"] for q in recs)
                       / sum(q["output_length"] - 1 for q in recs))
