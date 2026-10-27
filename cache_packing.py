@@ -85,6 +85,7 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
 
     starts = [model.NewIntVar(u.arrival, horizon, f"start[{i}]") for i, u in enumerate(trace)]
     ends = [model.NewIntVar(u.arrival, horizon, f"end[{i}]") for i, u in enumerate(trace)]
+    prefill_ends = [model.NewIntVar(u.arrival + 1, horizon, f"prefill_end[{i}]") for i, u in enumerate(trace)]
 
     # reuses[i][j] means j gets the largest possible cache hit from i.
     # TODO: Allow partial hits
@@ -94,10 +95,10 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     for i, u in enumerate(trace):
         model.Add(reuses[i][i] == False)
 
-    # To get a cache hit, you must start after your provider is done
+    # To get a cache hit, you must start after your provider's prefill is done
     for i in range(N):
         for j in range(N):
-            model.Add(ends[i] <= starts[j]).OnlyEnforceIf(reuses[i][j])
+            model.Add(prefill_ends[i] <= starts[j]).OnlyEnforceIf(reuses[i][j])
 
     # You may only get a cache hit from one provider
     for j in range(N):
@@ -117,12 +118,11 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
         prefill = model.NewIntVar(1, prefill_latency(v.isl), f"prefill[{j}]")
         model.Add(prefill == prefill_latency(v.isl) - sum(reuses[i][j] * saving(u, v, blk_size, prefill_latency) for i, u in enumerate(trace)))
         duration = prefill + v.osl
-        prefill_end = model.NewIntVar(v.arrival + 1, horizon, f"prefill_end[{j}]")
-        model.Add(prefill_end == starts[j] + prefill)
+        model.Add(prefill_ends[j] == starts[j] + prefill)
         for c in range(C):
             intervals[c].append(model.NewOptionalIntervalVar(starts[j], duration, ends[j], routes[j][c], f"lifetime[{j},{c}]"))
             sizes[c].append(v.isl + v.osl)
-            prefills[c].append(model.NewOptionalIntervalVar(starts[j], prefill, prefill_end, routes[j][c], f"prefill[{j},{c}]"))
+            prefills[c].append(model.NewOptionalIntervalVar(starts[j], prefill, prefill_ends[j], routes[j][c], f"prefill[{j},{c}]"))
 
     for c in range(C):
         model.AddNoOverlap(prefills[c])
@@ -194,9 +194,9 @@ def solve(model, vars):
     return solver, status
 
 if __name__ == "__main__":
-    num_requests = 256
-    trace, blk_size = from_weka("traces/weka_256k.jsonl", lanes=8, n=num_requests)
-    # trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
+    num_requests = 128
+    # trace, blk_size = from_weka("traces/weka_256k.jsonl", lanes=8, n=num_requests)
+    trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
     assert len(trace) == num_requests
     model, vars = build_model(trace, blk_size, num_caches=4, mem=16384*64, horizon=1_000_000, prefill_latency=default_latency)
     print("Built model, beginning solve...")
