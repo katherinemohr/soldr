@@ -1,5 +1,5 @@
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import islice
 from math import ceil
 from ortools.sat.python import cp_model
@@ -9,8 +9,12 @@ from calibrate import MockerLatency, compare
 class Request:
     isl: int
     osl: int
+    # Ignored in build_model for a request with a predecessor
     arrival: int
     hash_ids: list[int]
+    # Previous request in the same session: this one is released think timesteps after it ends
+    prev: int | None = None
+    think: int = 0
 
 default_latency = MockerLatency.load("mocker_params.json")
 
@@ -37,7 +41,7 @@ def from_weka(path, lanes, n=None, ms_per_step=default_latency.decode_ms, idle_c
 
     trace, offset = [], 0
     for play in plays:
-        shift, prev_t = 0.0, 0.0
+        shift, prev_t, prev_end = 0.0, 0.0, None
         for r in play["requests"]:
             idle = r["t"] - prev_t
             # Cap the gap between successive requests from a session. This
@@ -46,13 +50,19 @@ def from_weka(path, lanes, n=None, ms_per_step=default_latency.decode_ms, idle_c
             if idle > idle_cap_s:
                 shift += idle - idle_cap_s
             arrival = round((r["t"] - shift) * 1000) // ms_per_step
-            trace.append(Request(r["in"], r["out"], arrival, [h + offset for h in r["hash_ids"]]))
+            # Think time: from the previous request finishing in Weka to this one arriving
+            prev, think = (None, 0) if prev_end is None else (len(trace) - 1, max(0, arrival - prev_end))
+            trace.append(Request(r["in"], max(1, r["out"]), arrival, [h + offset for h in r["hash_ids"]], prev, think))
             prev_t = r["t"]
+            prev_end = round((r["t"] - shift + r["api_time"]) * 1000) // ms_per_step
         offset += 1 + max(h for r in play["requests"] for h in r["hash_ids"])
 
     assert len(trace) >= n
-    trace.sort(key=lambda u: u.arrival)
-    return trace[:n], blk_sizes.pop()
+    # A request's predecessor sorts before it, so it survives the truncation too
+    order = sorted(range(len(trace)), key=lambda i: trace[i].arrival)[:n]
+    pos = {i: k for k, i in enumerate(order)}
+    trace = [replace(trace[i], prev=None if trace[i].prev is None else pos[trace[i].prev]) for i in order]
+    return trace, blk_sizes.pop()
 
 def shared_tokens(u, v, blk_size):
     count = 0
@@ -69,7 +79,11 @@ def saving(u, v, blk_size, prefill_latency=default_latency):
 def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     N, C = len(trace), num_caches
     assert mem >= max([u.isl + u.osl for u in trace])
-    assert horizon > sorted(map(lambda u: prefill_latency(u.isl) + u.osl + u.arrival, trace))[-1]
+    # Earliest possible release
+    lbs = []
+    for u in trace:
+        lbs.append(u.arrival if u.prev is None else lbs[u.prev] + 1 + trace[u.prev].osl + u.think)
+    assert horizon > max(lb + prefill_latency(u.isl) + u.osl for lb, u in zip(lbs, trace))
     for u in trace:
         assert ceil(u.isl / blk_size) == len(u.hash_ids)
 
@@ -83,9 +97,15 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     for i, u in enumerate(trace):
         model.AddExactlyOne(routes[i][c] for c in range(C))
 
-    starts = [model.NewIntVar(u.arrival, horizon, f"start[{i}]") for i, u in enumerate(trace)]
-    ends = [model.NewIntVar(u.arrival, horizon, f"end[{i}]") for i, u in enumerate(trace)]
-    prefill_ends = [model.NewIntVar(u.arrival + 1, horizon, f"prefill_end[{i}]") for i, u in enumerate(trace)]
+    starts = [model.NewIntVar(lbs[i], horizon, f"start[{i}]") for i in range(N)]
+    ends = [model.NewIntVar(lbs[i], horizon, f"end[{i}]") for i in range(N)]
+    prefill_ends = [model.NewIntVar(lbs[i] + 1, horizon, f"prefill_end[{i}]") for i in range(N)]
+
+    # A session's first request is released at its arrival, and each later one think timesteps after its
+    # predecessor ends. TTFT counts from the release.
+    releases = [u.arrival if u.prev is None else ends[u.prev] + u.think for u in trace]
+    for i in range(N):
+        model.Add(starts[i] >= releases[i])
 
     # reuses[i][j] means j gets the largest possible cache hit from i.
     # TODO: Allow partial hits
@@ -167,11 +187,11 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     ttfts = []
     for i, u in enumerate(trace):
         ttft = model.NewIntVar(0, horizon, f"ttft[{i}]")
-        model.Add(ttft == ends[i] - u.osl - u.arrival)
+        model.Add(ttft == ends[i] - u.osl - releases[i])
         ttfts.append(ttft)
     model.minimize(sum(ttfts))
 
-    return model, dict(routes=routes, starts=starts, ends=ends, reuses=reuses, ttfts=ttfts)
+    return model, dict(routes=routes, starts=starts, ends=ends, reuses=reuses, releases=releases, ttfts=ttfts)
 
 class GapLogger(cp_model.CpSolverSolutionCallback):
     def on_solution_callback(self):
@@ -194,9 +214,9 @@ def solve(model, vars):
     return solver, status
 
 if __name__ == "__main__":
-    num_requests = 128
-    # trace, blk_size = from_weka("traces/weka_256k.jsonl", lanes=8, n=num_requests)
-    trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
+    num_requests = 256
+    trace, blk_size = from_weka("traces/weka_256k.jsonl", lanes=8, n=num_requests)
+    # trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
     assert len(trace) == num_requests
     model, vars = build_model(trace, blk_size, num_caches=4, mem=16384*64, horizon=1_000_000, prefill_latency=default_latency)
     print("Built model, beginning solve...")
