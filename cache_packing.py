@@ -9,14 +9,12 @@ from calibrate import MockerLatency, compare
 class Request:
     isl: int
     osl: int
-    # Ignored in build_model for a request with a predecessor
-    arrival: int
+    arrival: int | None
     hash_ids: list[int]
-    # Previous request in the same session: this one is released think timesteps after it ends
     prev: int | None = None
     think: int = 0
 
-default_latency = MockerLatency.load("mocker_params.json")
+default_latency = MockerLatency.load("qwen3-30b-a3b_h100x4")
 
 def from_mooncake(path, n=None, ms_per_step=default_latency.decode_ms):
     with open(path) as f:
@@ -25,41 +23,33 @@ def from_mooncake(path, n=None, ms_per_step=default_latency.decode_ms):
     trace = [Request(r["input_length"], r["output_length"], (r["timestamp"] - t0) // ms_per_step, r["hash_ids"]) for r in rows]
     return trace, 512
 
+# NOTE: Arrival timestamps for Weka are ignored, we use only think_time.
 def from_weka(path, lanes, n=None, ms_per_step=default_latency.decode_ms, idle_cap_s=300):
-    plays = []
+    sessions = []
     with open(path) as f:
         for line in f:
-            play = json.loads(line)
+            session = json.loads(line)
             # Ignore sessions with subagents
-            if all(r["type"] != "subagent" for r in play["requests"]):
-                plays.append(play)
-            if len(plays) == lanes:
+            if all(r["type"] != "subagent" for r in session["requests"]):
+                sessions.append(session)
+            if len(sessions) == lanes:
                 break
-    assert len(plays) == lanes, f"only {len(plays)} plays without subagents"
-    blk_sizes = {p["block_size"] for p in plays}
+    assert len(sessions) == lanes, f"only {len(sessions)} sessions without subagents"
+    blk_sizes = {p["block_size"] for p in sessions}
     assert len(blk_sizes) == 1
 
-    trace, offset = [], 0
-    for play in plays:
-        shift, prev_t, prev_end = 0.0, 0.0, None
-        for r in play["requests"]:
-            idle = r["t"] - prev_t
-            # Cap the gap between successive requests from a session. This
-            # appears to be a standard transformation for Weka and helps
-            # decrease the horizon for us.
-            if idle > idle_cap_s:
-                shift += idle - idle_cap_s
-            arrival = round((r["t"] - shift) * 1000) // ms_per_step
-            # Think time: from the previous request finishing in Weka to this one arriving
-            prev, think = (None, 0) if prev_end is None else (len(trace) - 1, max(0, arrival - prev_end))
-            trace.append(Request(r["in"], max(1, r["out"]), arrival, [h + offset for h in r["hash_ids"]], prev, think))
-            prev_t = r["t"]
-            prev_end = round((r["t"] - shift + r["api_time"]) * 1000) // ms_per_step
-        offset += 1 + max(h for r in play["requests"] for h in r["hash_ids"])
+    trace, ts, offset = [], [], 0
+    for session in sessions:
+        for k, r in enumerate(session["requests"]):
+            # Cap think time. This appears to be a standard transformation for
+            # Weka and helps decrease the horizon for us.
+            prev, think = (None, 0) if k == 0 else (len(trace) - 1, round(min(r["think_time"], idle_cap_s) * 1000) // ms_per_step)
+            ts.append(r["t"])
+            trace.append(Request(r["in"], max(1, r["out"]), 0 if k == 0 else None, [h + offset for h in r["hash_ids"]], prev, think))
+        offset += 1 + max(h for r in session["requests"] for h in r["hash_ids"])
 
     assert len(trace) >= n
-    # A request's predecessor sorts before it, so it survives the truncation too
-    order = sorted(range(len(trace)), key=lambda i: trace[i].arrival)[:n]
+    order = sorted(range(len(trace)), key=lambda i: ts[i])[:n]
     pos = {i: k for k, i in enumerate(order)}
     trace = [replace(trace[i], prev=None if trace[i].prev is None else pos[trace[i].prev]) for i in order]
     return trace, blk_sizes.pop()
@@ -79,11 +69,6 @@ def saving(u, v, blk_size, prefill_latency=default_latency):
 def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     N, C = len(trace), num_caches
     assert mem >= max([u.isl + u.osl for u in trace])
-    # Earliest possible release
-    lbs = []
-    for u in trace:
-        lbs.append(u.arrival if u.prev is None else lbs[u.prev] + 1 + trace[u.prev].osl + u.think)
-    assert horizon > max(lb + prefill_latency(u.isl) + u.osl for lb, u in zip(lbs, trace))
     for u in trace:
         assert ceil(u.isl / blk_size) == len(u.hash_ids)
 
@@ -97,12 +82,13 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     for i, u in enumerate(trace):
         model.AddExactlyOne(routes[i][c] for c in range(C))
 
-    starts = [model.NewIntVar(lbs[i], horizon, f"start[{i}]") for i in range(N)]
-    ends = [model.NewIntVar(lbs[i], horizon, f"end[{i}]") for i in range(N)]
-    prefill_ends = [model.NewIntVar(lbs[i] + 1, horizon, f"prefill_end[{i}]") for i in range(N)]
+    starts = [model.NewIntVar(0, horizon, f"start[{i}]") for i in range(N)]
+    ends = [model.NewIntVar(0, horizon, f"end[{i}]") for i in range(N)]
+    prefill_ends = [model.NewIntVar(1, horizon, f"prefill_end[{i}]") for i in range(N)]
 
-    # A session's first request is released at its arrival, and each later one think timesteps after its
-    # predecessor ends. TTFT counts from the release.
+    # For Mooncake a request is released at its arrival timestamp as given in
+    # the trace. For Weka, it's released think_time after the end of its
+    # predecessor.
     releases = [u.arrival if u.prev is None else ends[u.prev] + u.think for u in trace]
     for i in range(N):
         model.Add(starts[i] >= releases[i])
@@ -187,6 +173,7 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     ttfts = []
     for i, u in enumerate(trace):
         ttft = model.NewIntVar(0, horizon, f"ttft[{i}]")
+        # Weird, we can equivalently write ttft = prefill_ends[i] - releases[i] but that confuses the solver...
         model.Add(ttft == ends[i] - u.osl - releases[i])
         ttfts.append(ttft)
     model.minimize(sum(ttfts))
@@ -214,7 +201,7 @@ def solve(model, vars):
     return solver, status
 
 if __name__ == "__main__":
-    num_requests = 256
+    num_requests = 64
     trace, blk_size = from_weka("traces/weka_256k.jsonl", lanes=8, n=num_requests)
     # trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
     assert len(trace) == num_requests
