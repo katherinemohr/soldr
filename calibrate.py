@@ -62,8 +62,8 @@ def run_mocker(rows, workers, block_size, p):
                 f.write(json.dumps({"schema": "dynamo.agentic_mooncake", "version": 2, "block_size": block_size,
                                     "hash_id_scope": "local", "source": {"format": "soldr", "digest": "-"}}) + "\n")
             f.writelines(json.dumps(r) + "\n" for r in rows)
-        extra = dict(trace_format="agentic_mooncake", execution_model=p.aic["model"],
-                     agentic_lanes=len({r["play_id"] for r in rows})) if agentic else {}
+        # No agentic_lanes: with lanes, Mocker measures not_before_ms from each session's start, which drops our offsets
+        extra = dict(trace_format="agentic_mooncake", execution_model=p.aic["model"]) if agentic else {}
         report = run_trace_replay(path, extra_engine_args=mocker_engine(p), num_workers=workers, router_mode="kv_router",
                                   trace_block_size=block_size, capture_per_request=True, **extra)
     if agentic:
@@ -110,7 +110,8 @@ def compare(trace, blk_size, solver, vars, prefill_latency, mocker_runs=3):
         deps = lambda u: [] if u.prev is None else [dict(request_id=str(u.prev), trigger="completion",
                                                          delay_ms=u.think * dt, relation="sequence")]
         rows = [r | dict(request_id=str(j), play_id=str(session[j]), session_id=str(session[j]),
-                         model=prefill_latency.aic["model"], not_before_ms=0.0,
+                         # First turns are released at their arrival, later turns by their dependency only
+                         model=prefill_latency.aic["model"], not_before_ms=float(r["timestamp"]),
                          dependencies=deps(u))
                 for j, (r, u) in enumerate(zip(rows, trace))]
 

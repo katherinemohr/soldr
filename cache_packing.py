@@ -23,8 +23,8 @@ def from_mooncake(path, n=None, ms_per_step=default_latency.decode_ms):
     trace = [Request(r["input_length"], r["output_length"], (r["timestamp"] - t0) // ms_per_step, r["hash_ids"]) for r in rows]
     return trace, 512
 
-# NOTE: Arrival timestamps for Weka are ignored, we use only think_time.
-def from_weka(path, sessions, n=None, ms_per_step=default_latency.decode_ms, idle_cap_s=300):
+# Arrival timestamps for Weka are ignored, we use only think_time. Session starts are staggered.
+def from_weka(path, sessions, n=None, stagger_s=0, ms_per_step=default_latency.decode_ms, idle_cap_s=300):
     chosen = []
     with open(path) as f:
         for line in f:
@@ -38,18 +38,25 @@ def from_weka(path, sessions, n=None, ms_per_step=default_latency.decode_ms, idl
     blk_sizes = {p["block_size"] for p in chosen}
     assert len(blk_sizes) == 1
 
-    trace, ts, offset = [], [], 0
-    for session in chosen:
+    # est is a release time estimate using the recorded API times, used to pick the first n requests
+    trace, est, offset = [], [], 0
+    for s, session in enumerate(chosen):
+        t = s * stagger_s
         for k, r in enumerate(session["requests"]):
             # Cap think time. This appears to be a standard transformation for
             # Weka and helps decrease the horizon for us.
-            prev, think = (None, 0) if k == 0 else (len(trace) - 1, round(min(r["think_time"], idle_cap_s) * 1000) // ms_per_step)
-            ts.append(r["t"])
-            trace.append(Request(r["in"], max(1, r["out"]), 0 if k == 0 else None, [h + offset for h in r["hash_ids"]], prev, think))
+            think = 0 if k == 0 else min(r["think_time"], idle_cap_s)
+            t += think
+            est.append(t)
+            arrival = round(s * stagger_s * 1000) // ms_per_step if k == 0 else None
+            prev = None if k == 0 else len(trace) - 1
+            trace.append(Request(r["in"], max(1, r["out"]), arrival, [h + offset for h in r["hash_ids"]], prev,
+                                 round(think * 1000) // ms_per_step))
+            t += r["api_time"]
         offset += 1 + max(h for r in session["requests"] for h in r["hash_ids"])
 
     assert n is None or len(trace) >= n
-    order = sorted(range(len(trace)), key=lambda i: ts[i])[:n]
+    order = sorted(range(len(trace)), key=lambda i: est[i])[:n]
     pos = {i: k for k, i in enumerate(order)}
     trace = [replace(trace[i], prev=None if trace[i].prev is None else pos[trace[i].prev]) for i in order]
     return trace, blk_sizes.pop()
@@ -230,15 +237,17 @@ if __name__ == "__main__":
     # trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
 
     # Somewhere between 8-12 sessions per worker seems to be a reasonable config
-    # for Weka. But we should stagger their starts.
+    # for Weka.
     num_caches = 2
     sessions = 8 * num_caches
-    trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=12)
+    # 900 ms is the average session length for Weka
+    stagger_s = 900 // sessions
+    trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=12, stagger_s=stagger_s)
     print("Total requests: ", len(trace))
     model, vars = build_model(trace, blk_size, num_caches=num_caches, mem=default_latency.kv_capacity, horizon=10_000_000, prefill_latency=default_latency)
     print("Built model, beginning solve...")
     solver, status = solve(model, vars)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         compare(trace, blk_size, solver, vars, default_latency)
-        dump_schedule(f"{num_caches}c_{sessions}s_{len(trace)}r_{default_latency.config.split('-')[0]}",
+        dump_schedule(f"{num_caches}c_{sessions}s_{len(trace)}r_{stagger_s}st_{default_latency.config.split('-')[0]}",
                       trace, blk_size, solver, status, vars, default_latency)
