@@ -134,6 +134,7 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     for c in range(C):
         model.AddNoOverlap(prefills[c])
 
+    evicts, providers = [], []
     for i, u in enumerate(trace):
         # Time at which we evict u's prompt
         evict = model.NewIntVar(0, horizon, f"evict[{i}]")
@@ -141,6 +142,8 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
 
         # Is u providing a cache hit to anybody?
         is_provider = model.NewBoolVar(f"provider[{i}]")
+        evicts.append(evict)
+        providers.append(is_provider)
 
         for j in range(N):
             if shared[i][j] > 0:
@@ -180,15 +183,17 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
         ttfts.append(ttft)
     model.minimize(sum(ttfts))
 
-    return model, dict(routes=routes, starts=starts, ends=ends, reuses=reuses, releases=releases, ttfts=ttfts)
+    return model, dict(routes=routes, starts=starts, ends=ends, prefill_ends=prefill_ends, reuses=reuses, releases=releases,
+                       evicts=evicts, providers=providers, ttfts=ttfts)
 
 class GapLogger(cp_model.CpSolverSolutionCallback):
     def on_solution_callback(self):
         obj, bound = self.ObjectiveValue(), self.BestObjectiveBound()
         print(f"[{self.WallTime():.1f}s] obj={obj:.0f} bound={bound:.0f} gap={(obj - bound) / max(abs(obj), 1):.1%}")
 
-def solve(model, vars):
+def solve(model, vars, num_workers=0):
     solver = cp_model.CpSolver()
+    solver.parameters.num_workers = num_workers
     status = solver.Solve(model, GapLogger())
     print(solver.StatusName(status))
 
@@ -202,6 +207,24 @@ def solve(model, vars):
             print(f"Gap: {(obj - bound) / max(abs(obj), 1):.1%}")
     return solver, status
 
+def dump_schedule(config, trace, blk_size, solver, status, vars, prefill_latency):
+    value = solver.Value
+    requests = []
+    for j, v in enumerate(trace):
+        src = next((i for i in range(len(trace)) if value(vars["reuses"][i][j])), None)
+        requests.append(dict(
+            id=j, cache=next(c for c, r in enumerate(vars["routes"][j]) if value(r)), prev=v.prev, think=v.think,
+            isl=v.isl, osl=v.osl, release=value(vars["releases"][j]), start=value(vars["starts"][j]),
+            prefill_end=value(vars["prefill_ends"][j]), end=value(vars["ends"][j]), src=src,
+            hit=0 if src is None else shared_tokens(trace[src], v, blk_size), prefill_full=prefill_latency(v.isl),
+            ttft=value(vars["ttfts"][j]), evict=value(vars["evicts"][j]) if value(vars["providers"][j]) else None))
+    path = f"schedule_{config}.json"
+    with open(path, "w") as f:
+        json.dump(dict(params=prefill_latency.config, decode_ms=prefill_latency.decode_ms, blk_size=blk_size,
+                       status=solver.StatusName(status), obj=solver.ObjectiveValue(), bound=solver.BestObjectiveBound(),
+                       requests=requests), f, indent=1)
+    print("\nWrote", path)
+
 if __name__ == "__main__":
     # num_requests = 128
     # trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
@@ -210,10 +233,12 @@ if __name__ == "__main__":
     # for Weka. But we should stagger their starts.
     num_caches = 2
     sessions = 8 * num_caches
-    trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=64)
+    trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=12)
     print("Total requests: ", len(trace))
     model, vars = build_model(trace, blk_size, num_caches=num_caches, mem=default_latency.kv_capacity, horizon=10_000_000, prefill_latency=default_latency)
     print("Built model, beginning solve...")
     solver, status = solve(model, vars)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         compare(trace, blk_size, solver, vars, default_latency)
+        dump_schedule(f"{num_caches}c_{sessions}s_{len(trace)}r_{default_latency.config.split('-')[0]}",
+                      trace, blk_size, solver, status, vars, default_latency)
