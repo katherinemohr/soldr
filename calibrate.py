@@ -4,26 +4,19 @@ import tempfile
 from collections import defaultdict
 from dataclasses import asdict, dataclass, replace
 from math import ceil
-
 import numpy as np
 
-MOCKER_CONFIGS = {
-    "llama3.1-8b_h200x1": dict(max_model_len=131072, aic={"model": "meta-llama/Meta-Llama-3.1-8B", "system": "h200_sxm"}),
-    "qwen3-30b-a3b_h100x4": dict(max_model_len=262144, aic={"model": "Qwen/Qwen3-30B-A3B", "system": "h100_sxm", "tp": 4,
-                                                             "moe_tp_size": 4, "moe_ep_size": 1}),
-}
 
-
-def mocker_engine(config):
+def mocker_engine(p):
     return {
         "engine": {
-            "backend": "vllm", "block_size": 64, "num_gpu_blocks": 16384, "max_num_seqs": 256,
-            "max_num_batched_tokens": 8192, "enable_prefix_caching": True, "enable_chunked_prefill": True,
-            "max_model_len": MOCKER_CONFIGS[config]["max_model_len"],
-            "timing_model": {"type": "external", "provider": "aic", "config": MOCKER_CONFIGS[config]["aic"] | {
+            "backend": "vllm", "block_size": p.kv_block, "num_gpu_blocks": p.kv_capacity // p.kv_block,
+            "max_num_seqs": 256, "max_num_batched_tokens": p.chunk, "enable_prefix_caching": True,
+            "enable_chunked_prefill": True, "max_model_len": p.max_context,
+            "timing_model": {"type": "external", "provider": "aic", "config": p.aic | {
                 "backend": "vllm",
                 "backend_version": "0.24.0", "worker_type": "aggregated", "gemm_quant_mode": "bfloat16",
-                "fmha_quant_mode": "bfloat16", "kvcache_quant_mode": "bfloat16", "kv_block_size": 64,
+                "fmha_quant_mode": "bfloat16", "kvcache_quant_mode": "bfloat16", "kv_block_size": p.kv_block,
                 "estimation_mode": "op_level"}},
         },
         "num_gpu_blocks_is_explicit": True,
@@ -32,13 +25,16 @@ def mocker_engine(config):
 
 @dataclass(frozen=True)
 class MockerLatency:
-    config: str # key into MOCKER_CONFIGS
+    config: str # params_<config>.json
     decode_ms: int # one timestep
     a: float
     b: float
     c: float
     chunk: int
     kv_block: int
+    kv_capacity: int
+    max_context: int
+    aic: dict
 
     @classmethod
     def load(cls, config):
@@ -53,7 +49,7 @@ class MockerLatency:
         return max(1, round(self.prefill_ms(isl, hit) / self.decode_ms))
 
 
-def run_mocker(rows, workers, block_size, config):
+def run_mocker(rows, workers, block_size, p):
     os.environ.setdefault("DYN_LOG", "warn")
     from dynamo.replay import run_trace_replay
 
@@ -66,9 +62,9 @@ def run_mocker(rows, workers, block_size, config):
                 f.write(json.dumps({"schema": "dynamo.agentic_mooncake", "version": 2, "block_size": block_size,
                                     "hash_id_scope": "local", "source": {"format": "soldr", "digest": "-"}}) + "\n")
             f.writelines(json.dumps(r) + "\n" for r in rows)
-        extra = dict(trace_format="agentic_mooncake", execution_model=MOCKER_CONFIGS[config]["aic"]["model"],
+        extra = dict(trace_format="agentic_mooncake", execution_model=p.aic["model"],
                      agentic_lanes=len({r["play_id"] for r in rows})) if agentic else {}
-        report = run_trace_replay(path, extra_engine_args=mocker_engine(config), num_workers=workers, router_mode="kv_router",
+        report = run_trace_replay(path, extra_engine_args=mocker_engine(p), num_workers=workers, router_mode="kv_router",
                                   trace_block_size=block_size, capture_per_request=True, **extra)
     if agentic:
         recs = {q["request_id"]: q for q in report.to_dict()["per_request"]}
@@ -104,7 +100,7 @@ def compare(trace, blk_size, solver, vars, prefill_latency, mocker_runs=3):
     soldr_mocker = [0.0] * len(rows)
     for c in set(route):
         ix = sorted((j for j in range(len(rows)) if route[j] == c), key=lambda j: (submit[j], j))
-        for j, q in zip(ix, run_mocker([rows[j] | {"timestamp": submit[j]} for j in ix], 1, blk_size, prefill_latency.config)):
+        for j, q in zip(ix, run_mocker([rows[j] | {"timestamp": submit[j]} for j in ix], 1, blk_size, prefill_latency)):
             soldr_mocker[j] = submit[j] - release[j] + q["ttft_ms"]
 
     if any(u.prev is not None for u in trace):
@@ -114,12 +110,12 @@ def compare(trace, blk_size, solver, vars, prefill_latency, mocker_runs=3):
         deps = lambda u: [] if u.prev is None else [dict(request_id=str(u.prev), trigger="completion",
                                                          delay_ms=u.think * dt, relation="sequence")]
         rows = [r | dict(request_id=str(j), play_id=str(session[j]), session_id=str(session[j]),
-                         model=MOCKER_CONFIGS[prefill_latency.config]["aic"]["model"], not_before_ms=0.0,
+                         model=prefill_latency.aic["model"], not_before_ms=0.0,
                          dependencies=deps(u))
                 for j, (r, u) in enumerate(zip(rows, trace))]
 
     score = lambda recs: (soldr_ttft(rows, recs, prefill_latency), sum(q["ttft_ms"] for q in recs) / len(recs) / dt)
-    mocker = [score(run_mocker(rows, len(vars["routes"][0]), blk_size, prefill_latency.config)) for _ in range(mocker_runs)]
+    mocker = [score(run_mocker(rows, len(vars["routes"][0]), blk_size, prefill_latency)) for _ in range(mocker_runs)]
     soldr_soldr = sum(solver.Value(t) for t in vars["ttfts"]) / len(rows)
     table = [("Soldr decisions", soldr_soldr, sum(soldr_mocker) / len(rows) / dt),
              ("Mocker decisions", sum(s for s, _ in mocker) / mocker_runs, sum(m for _, m in mocker) / mocker_runs)]
@@ -128,8 +124,8 @@ def compare(trace, blk_size, solver, vars, prefill_latency, mocker_runs=3):
         print(f"{name:18s} {soldr:7.1f} {mock:7.1f}")
 
 
-def calibrate_ab(config):
-    chunk = mocker_engine(config)["engine"]["max_num_batched_tokens"]
+def calibrate_ab(p):
+    chunk = p.chunk
     rows, next_hash = [], 0
     for isl in [512, 1024, 2048, 4096, 8192, 12288, 16384, 24576, 32768, 49152, 65536, 98304, 131072, 196608, 245760]:
         for frac in [0, 0.25, 0.5, 0.75, 0.95]:
@@ -140,7 +136,7 @@ def calibrate_ab(config):
                              "hash_ids": hashes[:hit // 512]})
             rows.append({"timestamp": 60_000 * len(rows), "input_length": isl, "output_length": 1, "hash_ids": hashes})
     x, y = [], []
-    for r, q in zip(rows, run_mocker(rows, 1, 512, config)):
+    for r, q in zip(rows, run_mocker(rows, 1, 512, p)):
         new, hit = r["input_length"] - q["reused_input_tokens"], q["reused_input_tokens"]
         x.append([new, (r["input_length"] ** 2 - hit ** 2) / 2, ceil(new / chunk)])
         y.append(q["ttft_ms"])
@@ -150,15 +146,15 @@ def calibrate_ab(config):
 
 
 def calibrate(path, workers, config):
+    p = MockerLatency.load(config)
     with open(path) as f:
         rows = [json.loads(line) for line in f]
-    recs = run_mocker(rows, workers, 512, config)
+    recs = run_mocker(rows, workers, 512, p)
     target = sum(q["ttft_ms"] for q in recs) / len(recs)
     decode_ms = round(sum(q["last_token_ms"] - q["first_token_ms"] for q in recs)
                       / sum(q["output_length"] - 1 for q in recs))
-    a, b = calibrate_ab(config)
-    engine = mocker_engine(config)["engine"]
-    p = MockerLatency(config, decode_ms, a, b, 0.0, engine["max_num_batched_tokens"], engine["block_size"])
+    a, b = calibrate_ab(p)
+    p = replace(p, decode_ms=decode_ms, a=a, b=b)
     # Bisect for c
     lo, hi = 0.0, 100.0
     for _ in range(20):

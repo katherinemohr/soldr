@@ -5,5 +5,11 @@
  "b": 8.149139718901523e-07,
  "c": 21.5,
  "chunk": 8192,
- "kv_block": 64
+ "kv_block": 64,
+ "kv_capacity": 882688,
+ "max_context": 131072,
+ "aic": {
+  "model": "meta-llama/Meta-Llama-3.1-8B",
+  "system": "h200_sxm"
+ }
 }

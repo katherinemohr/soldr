@@ -24,22 +24,22 @@ def from_mooncake(path, n=None, ms_per_step=default_latency.decode_ms):
     return trace, 512
 
 # NOTE: Arrival timestamps for Weka are ignored, we use only think_time.
-def from_weka(path, lanes, n=None, ms_per_step=default_latency.decode_ms, idle_cap_s=300):
-    sessions = []
+def from_weka(path, sessions, n=None, ms_per_step=default_latency.decode_ms, idle_cap_s=300):
+    chosen = []
     with open(path) as f:
         for line in f:
             session = json.loads(line)
             # Ignore sessions with subagents
             if all(r["type"] != "subagent" for r in session["requests"]):
-                sessions.append(session)
-            if len(sessions) == lanes:
+                chosen.append(session)
+            if len(chosen) == sessions:
                 break
-    assert len(sessions) == lanes, f"only {len(sessions)} sessions without subagents"
-    blk_sizes = {p["block_size"] for p in sessions}
+    assert len(chosen) == sessions, f"only {len(chosen)} sessions without subagents"
+    blk_sizes = {p["block_size"] for p in chosen}
     assert len(blk_sizes) == 1
 
     trace, ts, offset = [], [], 0
-    for session in sessions:
+    for session in chosen:
         for k, r in enumerate(session["requests"]):
             # Cap think time. This appears to be a standard transformation for
             # Weka and helps decrease the horizon for us.
@@ -48,7 +48,7 @@ def from_weka(path, lanes, n=None, ms_per_step=default_latency.decode_ms, idle_c
             trace.append(Request(r["in"], max(1, r["out"]), 0 if k == 0 else None, [h + offset for h in r["hash_ids"]], prev, think))
         offset += 1 + max(h for r in session["requests"] for h in r["hash_ids"])
 
-    assert len(trace) >= n
+    assert n is None or len(trace) >= n
     order = sorted(range(len(trace)), key=lambda i: ts[i])[:n]
     pos = {i: k for k, i in enumerate(order)}
     trace = [replace(trace[i], prev=None if trace[i].prev is None else pos[trace[i].prev]) for i in order]
@@ -201,11 +201,16 @@ def solve(model, vars):
     return solver, status
 
 if __name__ == "__main__":
-    num_requests = 64
-    trace, blk_size = from_weka("traces/weka_256k.jsonl", lanes=8, n=num_requests)
+    # num_requests = 128
     # trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
-    assert len(trace) == num_requests
-    model, vars = build_model(trace, blk_size, num_caches=4, mem=16384*64, horizon=1_000_000, prefill_latency=default_latency)
+
+    # Somewhere between 8-12 sessions per worker seems to be a reasonable config
+    # for Weka. But we should stagger their starts.
+    num_caches = 4
+    sessions = 8 * num_caches
+    trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=512)
+    print("Total requests: ", len(trace))
+    model, vars = build_model(trace, blk_size, num_caches=num_caches, mem=default_latency.kv_capacity, horizon=10_000_000, prefill_latency=default_latency)
     print("Built model, beginning solve...")
     solver, status = solve(model, vars)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):

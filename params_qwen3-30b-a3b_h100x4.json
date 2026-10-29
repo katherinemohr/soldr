@@ -5,5 +5,14 @@
  "b": 3.0505150905564023e-07,
  "c": 15.9,
  "chunk": 8192,
- "kv_block": 64
+ "kv_block": 64,
+ "kv_capacity": 2333120,
+ "max_context": 262144,
+ "aic": {
+  "model": "Qwen/Qwen3-30B-A3B",
+  "system": "h100_sxm",
+  "tp": 4,
+  "moe_tp_size": 4,
+  "moe_ep_size": 1
+ }
 }
