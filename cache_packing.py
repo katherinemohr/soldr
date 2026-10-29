@@ -77,7 +77,9 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     routes = [[model.NewBoolVar(f"route[{i},{c}]") for c in range(C)] for i in range(N)]
 
     # For symmetry breaking
-    model.Add(routes[0][0] == True)
+    for j in range(min(N, C)):
+        for c in range(j + 1, C):
+            model.Add(routes[j][c] == False)
 
     for i, u in enumerate(trace):
         model.AddExactlyOne(routes[i][c] for c in range(C))
@@ -94,27 +96,25 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
         model.Add(starts[i] >= releases[i])
 
     # reuses[i][j] means j gets the largest possible cache hit from i.
-    # TODO: Allow partial hits
-    reuses = [[model.NewBoolVar(f"reuse[{i},{j}]") for j in range(N)] for i in range(N)]
-
-    # Don't get a cache hit from yourself
-    for i, u in enumerate(trace):
-        model.Add(reuses[i][i] == False)
+    # TODO: Allow fine-grained eviction
+    shared = [[shared_tokens(u, v, blk_size) if i != j else 0 for j, v in enumerate(trace)] for i, u in enumerate(trace)]
+    pairs = [(i, j) for i in range(N) for j in range(N) if shared[i][j] > 0]
+    reuses = [[model.NewConstant(0)] * N for i in range(N)]
+    for i, j in pairs:
+        reuses[i][j] = model.NewBoolVar(f"reuse[{i},{j}]")
 
     # To get a cache hit, you must start after your provider's prefill is done
-    for i in range(N):
-        for j in range(N):
-            model.Add(prefill_ends[i] <= starts[j]).OnlyEnforceIf(reuses[i][j])
+    for i, j in pairs:
+        model.Add(prefill_ends[i] <= starts[j]).OnlyEnforceIf(reuses[i][j])
 
     # You may only get a cache hit from one provider
     for j in range(N):
         model.AddAtMostOne(reuses[i][j] for i in range(N))
 
     # If i provides j a cache hit and j is routed to c, then i must also be routed to c
-    for i in range(N):
-        for j in range(N):
-            for c in range(C):
-                model.AddBoolOr([reuses[i][j].Not(), routes[j][c].Not(), routes[i][c]])
+    for i, j in pairs:
+        for c in range(C):
+            model.AddBoolOr([reuses[i][j].Not(), routes[j][c].Not(), routes[i][c]])
 
     intervals = [[] for c in range(C)]
     sizes = [[] for c in range(C)]
@@ -122,7 +122,8 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     for j, v in enumerate(trace):
         # Full cache hit costs 1 timestep
         prefill = model.NewIntVar(1, prefill_latency(v.isl), f"prefill[{j}]")
-        model.Add(prefill == prefill_latency(v.isl) - sum(reuses[i][j] * saving(u, v, blk_size, prefill_latency) for i, u in enumerate(trace)))
+        model.Add(prefill == prefill_latency(v.isl) - sum(reuses[i][j] * saving(u, v, blk_size, prefill_latency)
+                                                          for i, u in enumerate(trace) if shared[i][j] > 0))
         duration = prefill + v.osl
         model.Add(prefill_ends[j] == starts[j] + prefill)
         for c in range(C):
@@ -141,11 +142,12 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
         # Is u providing a cache hit to anybody?
         is_provider = model.NewBoolVar(f"provider[{i}]")
 
-        for j, v in enumerate(trace):
-            # If v is getting a cache hit from u, u's prompt must not be evicted until v starts
-            model.Add(evict >= starts[j]).OnlyEnforceIf(reuses[i][j])
-            # ... and u is a provider
-            model.AddImplication(reuses[i][j], is_provider)
+        for j in range(N):
+            if shared[i][j] > 0:
+                # If v is getting a cache hit from u, u's prompt must not be evicted until v starts
+                model.Add(evict >= starts[j]).OnlyEnforceIf(reuses[i][j])
+                # ... and u is a provider
+                model.AddImplication(reuses[i][j], is_provider)
 
         _evict = model.NewIntVar(0, horizon, f"_evict[{i}]")
         for c in range(C):
@@ -158,7 +160,7 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
 
             intervals[c].append(model.NewOptionalIntervalVar(ends[i], _evict, evict, cond, f"eviction[{i},{c}]"))
             # TODO: This is an overestimate I think
-            sizes[c].append(max(shared_tokens(u, v, blk_size) for j, v in enumerate(trace) if j != i))
+            sizes[c].append(max(shared[i]))
 
     for c in range(C):
         model.AddCumulative(intervals[c], sizes[c], mem)
@@ -206,9 +208,9 @@ if __name__ == "__main__":
 
     # Somewhere between 8-12 sessions per worker seems to be a reasonable config
     # for Weka. But we should stagger their starts.
-    num_caches = 4
+    num_caches = 2
     sessions = 8 * num_caches
-    trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=512)
+    trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=64)
     print("Total requests: ", len(trace))
     model, vars = build_model(trace, blk_size, num_caches=num_caches, mem=default_latency.kv_capacity, horizon=10_000_000, prefill_latency=default_latency)
     print("Built model, beginning solve...")
