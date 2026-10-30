@@ -66,25 +66,42 @@ def shared_tokens(u, v, blk_size):
 def saving(u, v, blk_size, prefill_latency=default_latency):
     return prefill_latency(v.isl) - prefill_latency(v.isl, shared_tokens(u, v, blk_size))
 
-def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
+def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency,
+                num_prefill=None, num_decode=None, mem_prefill=None, mem_decode=None):
     N, C = len(trace), num_caches
-    assert mem >= max([u.isl + u.osl for u in trace])
+    # Prefill and decode pools are sized independently. The defaults reproduce the
+    # monolithic configuration: one prefill and one decode worker per cache slot,
+    # sharing the single memory budget.
+    P = C if num_prefill is None else num_prefill
+    D = C if num_decode is None else num_decode
+    mem_p = mem if mem_prefill is None else mem_prefill
+    mem_d = mem if mem_decode is None else mem_decode
+    assert mem_p >= max(u.isl for u in trace)
+    assert mem_d >= max([u.isl + u.osl for u in trace])
     assert horizon > sorted(map(lambda u: prefill_latency(u.isl) + u.osl + u.arrival, trace))[-1]
     for u in trace:
         assert ceil(u.isl / blk_size) == len(u.hash_ids)
 
     model = cp_model.CpModel()
 
-    routes = [[model.NewBoolVar(f"route[{i},{c}]") for c in range(C)] for i in range(N)]
+    # Prefill routing decides who computes the prompt, and therefore whose KV cache
+    # can be reused by whom.
+    proute = [[model.NewBoolVar(f"proute[{i},{p}]") for p in range(P)] for i in range(N)]
+    # Decode routing only decides who pays the request's KV arena.
+    droute = [[model.NewBoolVar(f"droute[{i},{d}]") for d in range(D)] for i in range(N)]
 
     # For symmetry breaking
-    model.Add(routes[0][0] == True)
+    model.Add(proute[0][0] == True)
+    model.Add(droute[0][0] == True)
 
     for i, u in enumerate(trace):
-        model.AddExactlyOne(routes[i][c] for c in range(C))
+        model.AddExactlyOne(proute[i][p] for p in range(P))
+        model.AddExactlyOne(droute[i][d] for d in range(D))
 
-    starts = [model.NewIntVar(u.arrival, horizon, f"start[{i}]") for i, u in enumerate(trace)]
-    ends = [model.NewIntVar(u.arrival, horizon, f"end[{i}]") for i, u in enumerate(trace)]
+    pstarts = [model.NewIntVar(u.arrival, horizon, f"pstart[{i}]") for i, u in enumerate(trace)]
+    prends = [model.NewIntVar(u.arrival, horizon, f"prend[{i}]") for i, u in enumerate(trace)]
+    dstarts = [model.NewIntVar(u.arrival, horizon, f"dstart[{i}]") for i, u in enumerate(trace)]
+    dends = [model.NewIntVar(u.arrival, horizon, f"dend[{i}]") for i, u in enumerate(trace)]
 
     # reuses[i][j] means j gets the largest possible cache hit from i.
     # TODO: Allow partial hits
@@ -94,24 +111,29 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     for i, u in enumerate(trace):
         model.Add(reuses[i][i] == False)
 
-    # To get a cache hit, you must start after your provider is done
+    # To get a cache hit, your provider's prefill must have finished. Its decode runs
+    # on a different worker, so the provider's generation no longer blocks you.
     for i in range(N):
         for j in range(N):
-            model.Add(ends[i] <= starts[j]).OnlyEnforceIf(reuses[i][j])
+            model.Add(prends[i] <= pstarts[j]).OnlyEnforceIf(reuses[i][j])
 
     # You may only get a cache hit from one provider
     for j in range(N):
         model.AddAtMostOne(reuses[i][j] for i in range(N))
 
-    # If i provides j a cache hit and j is routed to c, then i must also be routed to c
+    # If i provides j a cache hit and j is prefilled on p, then i must be too
     for i in range(N):
         for j in range(N):
-            for c in range(C):
-                model.AddBoolOr([reuses[i][j].Not(), routes[j][c].Not(), routes[i][c]])
+            for p in range(P):
+                model.AddBoolOr([reuses[i][j].Not(), proute[j][p].Not(), proute[i][p]])
 
-    intervals = [[] for c in range(C)]
-    sizes = [[] for c in range(C)]
-    prefills = [[] for c in range(C)]
+    # Prefill pool: prompt KV while prefilling, plus retained prefixes for reuse.
+    p_intervals = [[] for p in range(P)]
+    p_sizes = [[] for p in range(P)]
+    prefills = [[] for p in range(P)]
+    # Decode pool: each request's whole KV arena, from its first decode to completion.
+    d_intervals = [[] for d in range(D)]
+    d_sizes = [[] for d in range(D)]
     for j, v in enumerate(trace):
         # Uncached prefill cost minus whatever hit is claimed
         raw_prefill = model.NewIntVar(0, prefill_latency(v.isl), f"raw_prefill[{j}]")
@@ -119,21 +141,28 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
         # Full cache hit costs 1 timestep, so floor rather than constrain
         prefill = model.NewIntVar(1, prefill_latency(v.isl), f"prefill[{j}]")
         model.AddMaxEquality(prefill, [raw_prefill, model.NewConstant(1)])
-        duration = prefill + v.osl
-        prefill_end = model.NewIntVar(v.arrival + 1, horizon, f"prefill_end[{j}]")
-        model.Add(prefill_end == starts[j] + prefill)
-        for c in range(C):
-            intervals[c].append(model.NewOptionalIntervalVar(starts[j], duration, ends[j], routes[j][c], f"lifetime[{j},{c}]"))
-            sizes[c].append(v.isl + v.osl)
-            prefills[c].append(model.NewOptionalIntervalVar(starts[j], prefill, prefill_end, routes[j][c], f"prefill[{j},{c}]"))
+        # The KV cache must have landed on the decode worker before it can decode
+        model.Add(prends[j] == pstarts[j] + prefill)
+        model.Add(dstarts[j] >= prends[j])
+        model.Add(dends[j] == dstarts[j] + v.osl)
+        for p in range(P):
+            # The prompt is resident on the prefill worker for exactly the prefill
+            prompt = model.NewOptionalIntervalVar(pstarts[j], prefill, prends[j], proute[j][p], f"prompt[{j},{p}]")
+            p_intervals[p].append(prompt)
+            p_sizes[p].append(v.isl)
+            prefills[p].append(prompt)
+        for d in range(D):
+            # Held for the decode duration, but it pins the whole isl+osl arena
+            d_intervals[d].append(model.NewOptionalIntervalVar(dstarts[j], v.osl, dends[j], droute[j][d], f"arena[{j},{d}]"))
+            d_sizes[d].append(v.isl + v.osl)
 
-    for c in range(C):
-        model.AddNoOverlap(prefills[c])
+    for p in range(P):
+        model.AddNoOverlap(prefills[p])
 
     for i, u in enumerate(trace):
         # Time at which we evict u's prompt
         evict = model.NewIntVar(0, horizon, f"evict[{i}]")
-        model.add(evict >= ends[i])
+        model.Add(evict >= prends[i])
 
         # Is u providing a cache hit to anybody?
         is_provider = model.NewBoolVar(f"provider[{i}]")
@@ -142,25 +171,27 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
             # If v is getting a cache hit from u, u's prompt must not be evicted until v's prefill is done.
             # Note the intervals below are half-open, so `evict >= starts[j]` would let u's prompt be freed
             # at the instant v begins prefilling, counting zero of the retained bytes.
-            model.Add(evict >= prefill_end[j]).OnlyEnforceIf(reuses[i][j])
+            model.Add(evict >= prends[j]).OnlyEnforceIf(reuses[i][j])
             # ... and u is a provider
             model.AddImplication(reuses[i][j], is_provider)
 
         _evict = model.NewIntVar(0, horizon, f"_evict[{i}]")
-        for c in range(C):
-            # cond == is_provider AND routes[i][c]
+        for p in range(P):
+            # cond == is_provider AND proute[i][p]
             # It's annoying that CP-SAT doesn't let us write SAT formulas naturally...
-            cond = model.NewBoolVar(f"cond[{i},{c}]")
-            model.AddBoolOr([is_provider.Not(), routes[i][c].Not(), cond])
+            cond = model.NewBoolVar(f"cond[{i},{p}]")
+            model.AddBoolOr([is_provider.Not(), proute[i][p].Not(), cond])
             model.AddImplication(cond, is_provider)
-            model.AddImplication(cond, routes[i][c])
+            model.AddImplication(cond, proute[i][p])
 
-            intervals[c].append(model.NewOptionalIntervalVar(ends[i], _evict, evict, cond, f"eviction[{i},{c}]"))
+            p_intervals[p].append(model.NewOptionalIntervalVar(prends[i], _evict, evict, cond, f"eviction[{i},{p}]"))
             # TODO: This is an overestimate I think
-            sizes[c].append(max(shared_tokens(u, v, blk_size) for j, v in enumerate(trace) if j != i))
+            p_sizes[p].append(max(shared_tokens(u, v, blk_size) for j, v in enumerate(trace) if j != i))
 
-    for c in range(C):
-        model.AddCumulative(intervals[c], sizes[c], mem)
+    for p in range(P):
+        model.AddCumulative(p_intervals[p], p_sizes[p], mem_p)
+    for d in range(D):
+        model.AddCumulative(d_intervals[d], d_sizes[d], mem_d)
 
     # waits = []
     # for i, u in enumerate(trace):
@@ -172,11 +203,17 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     ttfts = []
     for i, u in enumerate(trace):
         ttft = model.NewIntVar(0, horizon, f"ttft[{i}]")
-        model.Add(ttft == ends[i] - u.osl - u.arrival)
+        model.Add(ttft == prends[i] - u.arrival)
         ttfts.append(ttft)
     model.minimize(sum(ttfts))
 
-    return model, dict(routes=routes, starts=starts, ends=ends, reuses=reuses, ttfts=ttfts)
+    # routes/starts/ends are the prefill-side aliases that the runtime comparison
+    # consumes; the PD solve keys are exposed alongside them.
+    return model, dict(routes=proute, starts=pstarts, ends=prends,
+                       reuses=reuses, ttfts=ttfts,
+                       proute=proute, droute=droute,
+                       pstarts=pstarts, prends=prends,
+                       dstarts=dstarts, dends=dends)
 
 class GapLogger(cp_model.CpSolverSolutionCallback):
     def on_solution_callback(self):
