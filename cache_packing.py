@@ -139,8 +139,10 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
         is_provider = model.NewBoolVar(f"provider[{i}]")
 
         for j, v in enumerate(trace):
-            # If v is getting a cache hit from u, u's prompt must not be evicted until v starts
-            model.Add(evict >= starts[j]).OnlyEnforceIf(reuses[i][j])
+            # If v is getting a cache hit from u, u's prompt must not be evicted until v's prefill is done.
+            # Note the intervals below are half-open, so `evict >= starts[j]` would let u's prompt be freed
+            # at the instant v begins prefilling, counting zero of the retained bytes.
+            model.Add(evict >= prefill_end[j]).OnlyEnforceIf(reuses[i][j])
             # ... and u is a provider
             model.AddImplication(reuses[i][j], is_provider)
 
