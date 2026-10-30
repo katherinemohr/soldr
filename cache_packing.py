@@ -73,7 +73,8 @@ def shared_tokens(u, v, blk_size):
 def saving(u, v, blk_size, prefill_latency=default_latency):
     return prefill_latency(v.isl) - prefill_latency(v.isl, shared_tokens(u, v, blk_size))
 
-def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
+# objective is "mean" (sum of TTFTs) or a quantile in (0, 1), e.g. 0.9 for p90 TTFT
+def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, objective="mean"):
     N, C = len(trace), num_caches
     assert mem >= max([u.isl + u.osl for u in trace])
     for u in trace:
@@ -188,26 +189,39 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
         # Weird, we can equivalently write ttft = prefill_ends[i] - releases[i] but that confuses the solver...
         model.Add(ttft == ends[i] - u.osl - releases[i])
         ttfts.append(ttft)
-    model.minimize(sum(ttfts))
+
+    quantile = None
+    if objective == "mean":
+        model.minimize(sum(ttfts))
+    else:
+        k = ceil(objective * N)
+        quantile = model.NewIntVar(0, horizon, "quantile")
+        lates = [model.NewBoolVar(f"late[{i}]") for i in range(N)]
+        for ttft, late in zip(ttfts, lates):
+            model.Add(ttft <= quantile).OnlyEnforceIf(late.Not())
+        model.Add(sum(lates) <= N - k)
+        model.minimize(quantile)
 
     return model, dict(routes=routes, starts=starts, ends=ends, prefill_ends=prefill_ends, reuses=reuses, releases=releases,
-                       evicts=evicts, providers=providers, ttfts=ttfts)
+                       evicts=evicts, providers=providers, ttfts=ttfts, quantile=quantile)
 
 class GapLogger(cp_model.CpSolverSolutionCallback):
     def on_solution_callback(self):
         obj, bound = self.ObjectiveValue(), self.BestObjectiveBound()
         print(f"[{self.WallTime():.1f}s] obj={obj:.0f} bound={bound:.0f} gap={(obj - bound) / max(abs(obj), 1):.1%}")
 
-def solve(model, vars, num_workers=0):
+def solve(model, vars, objective="mean", num_workers=0):
     solver = cp_model.CpSolver()
     solver.parameters.num_workers = num_workers
     status = solver.Solve(model, GapLogger())
     print(solver.StatusName(status))
 
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        ttfts = vars["ttfts"]
-        avg_ttft = sum(solver.Value(t) for t in ttfts) / len(ttfts)
-        print("Avg TTFT: ", avg_ttft)
+        if objective == "mean":
+            ttfts = vars["ttfts"]
+            print("Avg TTFT: ", sum(solver.Value(t) for t in ttfts) / len(ttfts))
+        else:
+            print(f"P{objective * 100:g} TTFT: ", solver.Value(vars["quantile"]))
 
         if status != cp_model.OPTIMAL:
             obj, bound = solver.ObjectiveValue(), solver.BestObjectiveBound()
@@ -236,18 +250,20 @@ if __name__ == "__main__":
     # num_requests = 128
     # trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
 
-    # Somewhere between 8-12 sessions per worker seems to be a reasonable config
-    # for Weka.
-    num_caches = 2
-    sessions = 8 * num_caches
-    # 900 ms is the average session length for Weka
+    num_requests = 512
+    num_caches = 4
+    sessions = 16 * num_caches
+    # 900 s is the average session length for Weka
     stagger_s = 900 // sessions
-    trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=12, stagger_s=stagger_s)
+    objective = 0.90
+
+    trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=num_requests, stagger_s=stagger_s)
     print("Total requests: ", len(trace))
-    model, vars = build_model(trace, blk_size, num_caches=num_caches, mem=default_latency.kv_capacity, horizon=10_000_000, prefill_latency=default_latency)
+    model, vars = build_model(trace, blk_size, num_caches=num_caches, mem=default_latency.kv_capacity, horizon=10_000_000,
+                              prefill_latency=default_latency, objective=objective)
     print("Built model, beginning solve...")
-    solver, status = solve(model, vars)
+    solver, status = solve(model, vars, objective)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        compare(trace, blk_size, solver, vars, default_latency)
+        compare(trace, blk_size, solver, vars, default_latency, objective)
         dump_schedule(f"{num_caches}c_{sessions}s_{len(trace)}r_{stagger_s}st_{default_latency.config.split('-')[0]}",
                       trace, blk_size, solver, status, vars, default_latency)
