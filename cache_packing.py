@@ -113,9 +113,12 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency):
     sizes = [[] for c in range(C)]
     prefills = [[] for c in range(C)]
     for j, v in enumerate(trace):
-        # Full cache hit costs 1 timestep
+        # Uncached prefill cost minus whatever hit is claimed
+        raw_prefill = model.NewIntVar(0, prefill_latency(v.isl), f"raw_prefill[{j}]")
+        model.Add(raw_prefill == prefill_latency(v.isl) - sum(reuses[i][j] * saving(u, v, blk_size, prefill_latency) for i, u in enumerate(trace)))
+        # Full cache hit costs 1 timestep, so floor rather than constrain
         prefill = model.NewIntVar(1, prefill_latency(v.isl), f"prefill[{j}]")
-        model.Add(prefill == prefill_latency(v.isl) - sum(reuses[i][j] * saving(u, v, blk_size, prefill_latency) for i, u in enumerate(trace)))
+        model.AddMaxEquality(prefill, [raw_prefill, model.NewConstant(1)])
         duration = prefill + v.osl
         prefill_end = model.NewIntVar(v.arrival + 1, horizon, f"prefill_end[{j}]")
         model.Add(prefill_end == starts[j] + prefill)
