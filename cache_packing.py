@@ -66,8 +66,13 @@ def shared_tokens(u, v, blk_size):
 def saving(u, v, blk_size, prefill_latency=default_latency):
     return prefill_latency(v.isl) - prefill_latency(v.isl, shared_tokens(u, v, blk_size))
 
+# Steps of network time to ship a prompt of `isl` tokens to its decode worker
+def transfer_steps(isl, transfer_bw):
+    return 0 if not transfer_bw else -(-isl // transfer_bw)
+
 def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency,
-                num_prefill=None, num_decode=None, mem_prefill=None, mem_decode=None):
+                num_prefill=None, num_decode=None, mem_prefill=None, mem_decode=None,
+                transfer_bw=0, makespan_weight=1):
     N, C = len(trace), num_caches
     # Prefill and decode pools are sized independently. The defaults reproduce the
     # monolithic configuration: one prefill and one decode worker per cache slot,
@@ -78,7 +83,8 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency,
     mem_d = mem if mem_decode is None else mem_decode
     assert mem_p >= max(u.isl for u in trace)
     assert mem_d >= max([u.isl + u.osl for u in trace])
-    assert horizon > sorted(map(lambda u: prefill_latency(u.isl) + u.osl + u.arrival, trace))[-1]
+    assert horizon > sorted(map(lambda u: prefill_latency(u.isl) + u.osl + u.arrival +
+                                transfer_steps(u.isl, transfer_bw), trace))[-1]
     for u in trace:
         assert ceil(u.isl / blk_size) == len(u.hash_ids)
 
@@ -141,16 +147,22 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency,
         # Full cache hit costs 1 timestep, so floor rather than constrain
         prefill = model.NewIntVar(1, prefill_latency(v.isl), f"prefill[{j}]")
         model.AddMaxEquality(prefill, [raw_prefill, model.NewConstant(1)])
-        # The KV cache must have landed on the decode worker before it can decode
+        # Shipping the untouched prompt KV to the decode worker costs ceil(isl / transfer_bw)
+        # steps. It is paid in full even on a cache hit: the hit saves prefill compute,
+        # not the bytes that must land on the decode worker.
+        tfer = transfer_steps(v.isl, transfer_bw)
         model.Add(prends[j] == pstarts[j] + prefill)
-        model.Add(dstarts[j] >= prends[j])
+        # The KV cache must have landed on the decode worker before it can decode
+        model.Add(dstarts[j] >= prends[j] + tfer)
         model.Add(dends[j] == dstarts[j] + v.osl)
         for p in range(P):
-            # The prompt is resident on the prefill worker for exactly the prefill
+            # Prefill compute: the prompt occupies the worker for exactly the prefill
             prompt = model.NewOptionalIntervalVar(pstarts[j], prefill, prends[j], proute[j][p], f"prompt[{j},{p}]")
-            p_intervals[p].append(prompt)
-            p_sizes[p].append(v.isl)
             prefills[p].append(prompt)
+            # The prompt stays resident through the transfer, which is not compute
+            prompt_mem = model.NewOptionalIntervalVar(pstarts[j], prefill + tfer, prends[j] + tfer, proute[j][p], f"prompt_mem[{j},{p}]")
+            p_intervals[p].append(prompt_mem)
+            p_sizes[p].append(v.isl)
         for d in range(D):
             # Held for the decode duration, but it pins the whole isl+osl arena
             d_intervals[d].append(model.NewOptionalIntervalVar(dstarts[j], v.osl, dends[j], droute[j][d], f"arena[{j},{d}]"))
@@ -160,9 +172,11 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency,
         model.AddNoOverlap(prefills[p])
 
     for i, u in enumerate(trace):
-        # Time at which we evict u's prompt
+        # Time at which u's prompt stops occupying memory as a whole and, if it is a
+        # provider, survives only as a retained prefix. That is after its own transfer.
+        release = prends[i] + transfer_steps(u.isl, transfer_bw)
         evict = model.NewIntVar(0, horizon, f"evict[{i}]")
-        model.Add(evict >= prends[i])
+        model.Add(evict >= release)
 
         # Is u providing a cache hit to anybody?
         is_provider = model.NewBoolVar(f"provider[{i}]")
@@ -184,7 +198,7 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency,
             model.AddImplication(cond, is_provider)
             model.AddImplication(cond, proute[i][p])
 
-            p_intervals[p].append(model.NewOptionalIntervalVar(prends[i], _evict, evict, cond, f"eviction[{i},{p}]"))
+            p_intervals[p].append(model.NewOptionalIntervalVar(release, _evict, evict, cond, f"eviction[{i},{p}]"))
             # TODO: This is an overestimate I think
             p_sizes[p].append(max(shared_tokens(u, v, blk_size) for j, v in enumerate(trace) if j != i))
 
@@ -200,12 +214,29 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency,
     #     waits.append(wait)
     # model.minimize(sum(waits))
 
+    # TTFT is the prefill-side metric: arrival to the prompt being ready. It stays
+    # exposed because the runtime comparison consumes it.
     ttfts = []
+    # Latency is the decode-side metric: arrival to the last token. Under PD the first
+    # token lands only after the transfer, so this is what the objective scores.
+    latencies = []
     for i, u in enumerate(trace):
         ttft = model.NewIntVar(0, horizon, f"ttft[{i}]")
         model.Add(ttft == prends[i] - u.arrival)
         ttfts.append(ttft)
-    model.minimize(sum(ttfts))
+
+        latency = model.NewIntVar(0, horizon, f"latency[{i}]")
+        model.Add(latency == dends[i] - u.arrival)
+        latencies.append(latency)
+
+    # Nothing else rewards finishing a decode early, so the solver is free to park
+    # generations at the end of the horizon. Penalise the makespan to prevent that.
+    makespan = model.NewIntVar(0, horizon, "makespan")
+    for i in range(N):
+        model.Add(makespan >= dends[i])
+
+    # Minimise N * (average latency + makespan_weight * makespan), kept integral
+    model.minimize(sum(latencies) + N * makespan_weight * makespan)
 
     # routes/starts/ends are the prefill-side aliases that the runtime comparison
     # consumes; the PD solve keys are exposed alongside them.
@@ -213,7 +244,8 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency,
                        reuses=reuses, ttfts=ttfts,
                        proute=proute, droute=droute,
                        pstarts=pstarts, prends=prends,
-                       dstarts=dstarts, dends=dends)
+                       dstarts=dstarts, dends=dends,
+                       latencies=latencies, makespan=makespan)
 
 class GapLogger(cp_model.CpSolverSolutionCallback):
     def on_solution_callback(self):
@@ -227,8 +259,10 @@ def solve(model, vars):
 
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         ttfts = vars["ttfts"]
-        avg_ttft = sum(solver.Value(t) for t in ttfts) / len(ttfts)
-        print("Avg TTFT: ", avg_ttft)
+        latencies = vars["latencies"]
+        print("Avg TTFT: ", sum(solver.Value(t) for t in ttfts) / len(ttfts))
+        print("Avg latency: ", sum(solver.Value(t) for t in latencies) / len(latencies))
+        print("Makespan: ", solver.Value(vars["makespan"]))
 
         if status != cp_model.OPTIMAL:
             obj, bound = solver.ObjectiveValue(), solver.BestObjectiveBound()
