@@ -167,20 +167,25 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, obje
                 same = model.NewBoolVar(f"same_worker[{i},{j}]")
                 model.Add(workers[i] == workers[j]).OnlyEnforceIf(same)
                 model.Add(workers[i] != workers[j]).OnlyEnforceIf(same.Not())
-                before, interrupted, after, interrupts = [model.NewBoolVar(f"order[{i},{j},{k}]") for k in range(4)]
+                i_before_j, j_blocks_i, j_before_i, i_blocks_j = [
+                    model.NewBoolVar(f"order[{i},{j},{state}]")
+                    for state in ("i_before_j", "j_blocks_i", "j_before_i", "i_blocks_j")
+                ]
                 # The same-worker pair has exactly one of four regions. A
                 # prefill cannot straddle another prefill, or the final decode
                 # step. Consequently an interruption counts its FULL duration.
-                model.Add(before + interrupted + after + interrupts == same)
-                model.Add(ends[i] <= starts[j]).OnlyEnforceIf(before)
-                model.Add(prefill_ends[i] <= starts[j]).OnlyEnforceIf(interrupted)
-                model.Add(prefill_ends[j] + 1 <= ends[i]).OnlyEnforceIf(interrupted)
-                model.Add(ends[j] <= starts[i]).OnlyEnforceIf(after)
-                model.Add(prefill_ends[j] <= starts[i]).OnlyEnforceIf(interrupts)
-                model.Add(prefill_ends[i] + 1 <= ends[j]).OnlyEnforceIf(interrupts)
-                for receiver, provider, condition in [(i, j, interrupted), (j, i, interrupts)]:
-                    pause = model.NewIntVar(0, prefill_latency(trace[provider].isl), f"blocked[{receiver},{provider}]")
-                    model.Add(pause == prefill_durations[provider]).OnlyEnforceIf(condition)
+                model.Add(i_before_j + j_blocks_i + j_before_i + i_blocks_j == same)
+                model.Add(ends[i] <= starts[j]).OnlyEnforceIf(i_before_j)
+                model.Add(prefill_ends[i] <= starts[j]).OnlyEnforceIf(j_blocks_i)
+                # +1 requires a final decode step AFTER the blocking prefill.
+                # Otherwise an already-finished request could drift through it.
+                model.Add(prefill_ends[j] + 1 <= ends[i]).OnlyEnforceIf(j_blocks_i)
+                model.Add(ends[j] <= starts[i]).OnlyEnforceIf(j_before_i)
+                model.Add(prefill_ends[j] <= starts[i]).OnlyEnforceIf(i_blocks_j)
+                model.Add(prefill_ends[i] + 1 <= ends[j]).OnlyEnforceIf(i_blocks_j)
+                for receiver, blocker, condition in [(i, j, j_blocks_i), (j, i, i_blocks_j)]:
+                    pause = model.NewIntVar(0, prefill_latency(trace[blocker].isl), f"blocked[{receiver},{blocker}]")
+                    model.Add(pause == prefill_durations[blocker]).OnlyEnforceIf(condition)
                     model.Add(pause == 0).OnlyEnforceIf(condition.Not())
                     blocked[receiver].append(pause)
         for i, u in enumerate(trace):
@@ -284,6 +289,7 @@ def solve(model, vars, objective="mean", num_workers=0, time_limit=None):
     return solver, status
 
 def dump_schedule(config, trace, blk_size, solver, status, vars, prefill_latency):
+    """Export a solved schedule and return its path."""
     value = solver.Value
     requests = []
     for j, v in enumerate(trace):
@@ -296,9 +302,10 @@ def dump_schedule(config, trace, blk_size, solver, status, vars, prefill_latency
             ttft=value(vars["ttfts"][j]), e2e=value(vars["e2es"][j]),
             evict=value(vars["evicts"][j]) if value(vars["providers"][j]) else None))
     if vars["exclusive_prefill"]:
+        ordered_prefills = sorted(requests, key=lambda q: q["start"])
         for r in requests:
             cursor, segments = r["prefill_end"], []
-            for other in sorted(requests, key=lambda q: q["start"]):
+            for other in ordered_prefills:
                 if other["cache"] != r["cache"] or other["prefill_end"] <= cursor or other["start"] >= r["end"]:
                     continue
                 if cursor < other["start"]:
@@ -319,6 +326,7 @@ def dump_schedule(config, trace, blk_size, solver, status, vars, prefill_latency
                        obj=solver.ObjectiveValue(), bound=solver.BestObjectiveBound(),
                        requests=requests), f, indent=1)
     print("\nWrote", path)
+    return path
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Optimize cache placements for TTFT or end-to-end latency.")

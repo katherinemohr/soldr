@@ -19,6 +19,11 @@ import cache_packing as packing
 ROOT = Path(__file__).resolve().parent
 
 
+def check_demo(condition, case, message):
+    if not condition:
+        raise RuntimeError(f'{case}: {message}. The calibrated timings may need different demo arrivals or lengths.')
+
+
 def main():
     latency = packing.default_latency
     dt, prefill = latency.decode_ms, latency(8192)
@@ -57,31 +62,37 @@ def main():
         if status != cp_model.OPTIMAL:
             raise RuntimeError(f'{case}: expected a proven optimum, got {solver.StatusName(status)}')
         # Demonstrations should emerge naturally from arrivals and worker count.
-        assert all(solver.Value(variables['starts'][i]) == arrival for i, (arrival, _) in enumerate(workload))
+        check_demo(all(solver.Value(variables['starts'][i]) == arrival for i, (arrival, _) in enumerate(workload)),
+                   case, 'a request did not start at arrival')
         config = f'bubbles_{case}_mean'
-        packing.dump_schedule(config, trace, block_size, solver, status, variables, latency)
-        schedule = ROOT / 'outputs' / f'schedule_{config}_aggregate_e2e.json'
+        schedule = packing.dump_schedule(config, trace, block_size, solver, status, variables, latency)
         data = json.loads(schedule.read_text())
         data['description'] = (f'{workers} worker(s); distinct 8,192-token prompts; each prefill takes '
                                f'{prefill * dt} ms. Starts and placements were chosen by the solver. ' + description)
         data['trace_source'] = str(trace_path)
         for request, row in zip(data['requests'], rows):
             request['prefix_group'] = row['prefix_group']
-            assert sum(b-a for a, b in request['decode_segments']) == request['osl']
+            check_demo(sum(b-a for a, b in request['decode_segments']) == request['osl'],
+                       case, f"request #{request['id']} has incorrect decode work")
             for a, b in request['decode_segments']:
                 for other in data['requests']:
                     if request['cache'] == other['cache']:
-                        assert b <= other['start'] or a >= other['prefill_end']
+                        check_demo(b <= other['start'] or a >= other['prefill_end'],
+                                   case, f"request #{request['id']} decodes during a prefill")
         a = data['requests'][0]
         if case == '01_repeated_pauses':
-            assert a['decode_pause'] == 2 * prefill and len(a['decode_segments']) == 3
-            assert data['requests'][1]['decode_pause'] == prefill
+            check_demo(a['decode_pause'] == 2 * prefill and len(a['decode_segments']) == 3
+                       and data['requests'][1]['decode_pause'] == prefill,
+                       case, 'expected two pauses in #0 and one in #1')
         elif case == '02_one_pause':
-            assert a['decode_pause'] == prefill and len(a['decode_segments']) == 2
+            check_demo(a['decode_pause'] == prefill and len(a['decode_segments']) == 2,
+                       case, 'expected one pause in #0')
         elif case == '03_other_worker':
-            assert a['cache'] != data['requests'][1]['cache'] and a['decode_pause'] == 0
+            check_demo(a['cache'] != data['requests'][1]['cache'] and a['decode_pause'] == 0,
+                       case, 'expected separate workers with no pause')
         else:
-            assert a['end'] == data['requests'][1]['start'] and a['decode_pause'] == 0
+            check_demo(a['end'] == data['requests'][1]['start'] and a['decode_pause'] == 0,
+                       case, 'expected #0 to finish exactly when #1 starts')
         schedule.write_text(json.dumps(data, indent=1) + '\n')
         schedules.append(schedule)
         print(f'{case}: OPTIMAL in {solver.WallTime():.3f}s')
