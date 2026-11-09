@@ -2,6 +2,7 @@ import json
 from dataclasses import dataclass, replace
 from itertools import islice
 from math import ceil
+from pathlib import Path
 from ortools.sat.python import cp_model
 from calibrate import MockerLatency, compare
 
@@ -239,7 +240,9 @@ def dump_schedule(config, trace, blk_size, solver, status, vars, prefill_latency
             prefill_end=value(vars["prefill_ends"][j]), end=value(vars["ends"][j]), src=src,
             hit=0 if src is None else shared_tokens(trace[src], v, blk_size), prefill_full=prefill_latency(v.isl),
             ttft=value(vars["ttfts"][j]), evict=value(vars["evicts"][j]) if value(vars["providers"][j]) else None))
-    path = f"schedule_{config}.json"
+    output_dir = Path(__file__).resolve().parent / "outputs"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"schedule_{config}.json"
     with open(path, "w") as f:
         json.dump(dict(params=prefill_latency.config, decode_ms=prefill_latency.decode_ms, blk_size=blk_size,
                        status=solver.StatusName(status), obj=solver.ObjectiveValue(), bound=solver.BestObjectiveBound(),
@@ -247,17 +250,18 @@ def dump_schedule(config, trace, blk_size, solver, status, vars, prefill_latency
     print("\nWrote", path)
 
 if __name__ == "__main__":
-    # num_requests = 128
-    # trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
+    num_requests = 128
+    trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
 
-    num_requests = 512
+    # num_requests = 512
     num_caches = 4
     sessions = 16 * num_caches
     # 900 s is the average session length for Weka
     stagger_s = 900 // sessions
     objective = 0.90
 
-    trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=num_requests, stagger_s=stagger_s)
+    # trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=num_requests, stagger_s=stagger_s)
+
     print("Total requests: ", len(trace))
     model, vars = build_model(trace, blk_size, num_caches=num_caches, mem=default_latency.kv_capacity, horizon=10_000_000,
                               prefill_latency=default_latency, objective=objective)
