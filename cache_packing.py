@@ -260,7 +260,7 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, obje
 
     return model, dict(routes=routes, starts=starts, ends=ends, prefill_ends=prefill_ends, reuses=reuses, releases=releases,
                        evicts=evicts, providers=providers, ttfts=ttfts, e2es=e2es, quantile=quantile,
-                       objective=objective, metric=metric, exclusive_prefill=exclusive_prefill, blocked=blocked)
+                       objective=objective, metric=metric, exclusive_prefill=exclusive_prefill)
 
 class GapLogger(cp_model.CpSolverSolutionCallback):
     def on_solution_callback(self):
@@ -334,14 +334,11 @@ if __name__ == "__main__":
     parser.add_argument("--objective", choices=("mean", "p90"), default="p90", help="aggregation (default: p90)")
     parser.add_argument("--exclusive-prefill", action="store_true", help="pause decode using whole-prefill overlap constraints")
     parser.add_argument("--time-limit", type=float, default=None, help="solver seconds (default: unlimited)")
-    parser.add_argument("--num-workers", type=int, default=4, help="CP-SAT search threads (default: 4)")
-    parser.add_argument("--requests", type=int, default=128)
-    parser.add_argument("--trace", default="traces/mooncake_conversation.jsonl")
     args = parser.parse_args()
-    if args.requests <= 0 or args.num_workers <= 0 or (args.time_limit is not None and args.time_limit <= 0):
-        parser.error("requests, num-workers, and time-limit must be positive")
-    num_requests = args.requests
-    trace, blk_size = from_mooncake(args.trace, n=num_requests)
+    if args.time_limit is not None and args.time_limit <= 0:
+        parser.error("time-limit must be positive")
+    num_requests = 128
+    trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
 
     # num_requests = 512
     num_caches = 4
@@ -353,17 +350,15 @@ if __name__ == "__main__":
     # trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=num_requests, stagger_s=stagger_s)
 
     print("Total requests: ", len(trace))
-    # A cold serial schedule after the last external arrival is a safe bound.
-    horizon = max(u.arrival or 0 for u in trace) + sum(default_latency(u.isl) + u.osl + u.think for u in trace) + 1
-    model, vars = build_model(trace, blk_size, num_caches=num_caches, mem=default_latency.kv_capacity, horizon=horizon,
+    model, vars = build_model(trace, blk_size, num_caches=num_caches, mem=default_latency.kv_capacity, horizon=10_000_000,
                               prefill_latency=default_latency, objective=objective, metric=args.metric,
                               exclusive_prefill=args.exclusive_prefill)
     print("Built model, beginning solve...")
-    solver, status = solve(model, vars, objective, num_workers=args.num_workers, time_limit=args.time_limit)
+    solver, status = solve(model, vars, objective, time_limit=args.time_limit)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         if args.exclusive_prefill:
             print("Mocker comparison skipped: its replay does not enforce exclusive prefill.")
         else:
             compare(trace, blk_size, solver, vars, default_latency, objective)
-        dump_schedule(f"{Path(args.trace).stem}_{num_caches}c_{len(trace)}r_{args.objective}_{default_latency.config.split('-')[0]}",
+        dump_schedule(f"{num_caches}c_{sessions}s_{len(trace)}r_{stagger_s}st_{default_latency.config.split('-')[0]}",
                       trace, blk_size, solver, status, vars, default_latency)

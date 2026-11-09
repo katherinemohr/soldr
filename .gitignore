@@ -5,3 +5,4 @@ traces/weka_256k.jsonl
 traces/synthetic/
 .venv/
 outputs/
+visualization/decode_bubbles.html
