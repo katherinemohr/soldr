@@ -76,6 +76,7 @@ def solve_case(case, trace, rows, block_size, args):
     model, variables = packing.build_model(
         trace, block_size, num_caches=NUM_WORKERS, mem=latency.kv_capacity,
         horizon=horizon, prefill_latency=latency, objective=objective, metric=args.metric,
+        exclusive_prefill=args.exclusive_prefill,
     )
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = args.time_limit
@@ -121,6 +122,7 @@ def main():
     parser.add_argument("--solve", action="store_true", help="also run the cache-packing optimizer")
     parser.add_argument("--objective", choices=("mean", "p90"), default="mean")
     parser.add_argument("--metric", choices=("ttft", "e2e"), default="e2e", help="latency to optimize (default: e2e)")
+    parser.add_argument("--exclusive-prefill", action="store_true", help="pause decode using whole-prefill overlap constraints")
     parser.add_argument("--time-limit", type=float, default=30, help="solver seconds per case")
     parser.add_argument("--wave-ms", type=int, default=WAVE_MS,
                         help="milliseconds between waves; 0 for a simultaneous burst (default: 60)")

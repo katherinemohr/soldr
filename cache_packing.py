@@ -76,7 +76,13 @@ def saving(u, v, blk_size, prefill_latency=default_latency):
     return prefill_latency(v.isl) - prefill_latency(v.isl, shared_tokens(u, v, blk_size))
 
 # metric selects TTFT or E2E; objective aggregates it as a mean or quantile (e.g. 0.9).
-def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, objective="mean", metric="e2e"):
+def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, objective="mean", metric="e2e",
+                exclusive_prefill=False):
+    """Optional exclusive prefill uses whole-prefill interruptions, not token variables.
+
+    Decode progresses at one token per free step for every active request on a
+    worker. Only prefills can pause it; concurrent decode remains unbounded.
+    """
     if metric not in ("ttft", "e2e"):
         raise ValueError("metric must be 'ttft' or 'e2e'")
     N, C = len(trace), num_caches
@@ -131,13 +137,18 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, obje
     intervals = [[] for c in range(C)]
     sizes = [[] for c in range(C)]
     prefills = [[] for c in range(C)]
+    prefill_durations = []
     for j, v in enumerate(trace):
         # Full cache hit costs 1 timestep
         prefill = model.NewIntVar(1, prefill_latency(v.isl), f"prefill[{j}]")
+        prefill_durations.append(prefill)
         model.Add(prefill == prefill_latency(v.isl) - sum(reuses[i][j] * saving(u, v, blk_size, prefill_latency)
                                                           for i, u in enumerate(trace) if shared[i][j] > 0))
         duration = prefill + v.osl
         model.Add(prefill_ends[j] == starts[j] + prefill)
+        if exclusive_prefill:
+            duration = model.NewIntVar(0, horizon, f"duration[{j}]")
+            model.Add(duration == ends[j] - starts[j])
         for c in range(C):
             intervals[c].append(model.NewOptionalIntervalVar(starts[j], duration, ends[j], routes[j][c], f"lifetime[{j},{c}]"))
             sizes[c].append(v.isl + v.osl)
@@ -145,6 +156,37 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, obje
 
     for c in range(C):
         model.AddNoOverlap(prefills[c])
+
+    blocked = [[] for _ in trace]
+    if exclusive_prefill:
+        workers = [model.NewIntVar(0, C - 1, f"worker[{i}]") for i in range(N)]
+        for i in range(N):
+            model.Add(workers[i] == sum(c * routes[i][c] for c in range(C)))
+        for i in range(N):
+            for j in range(i + 1, N):
+                same = model.NewBoolVar(f"same_worker[{i},{j}]")
+                model.Add(workers[i] == workers[j]).OnlyEnforceIf(same)
+                model.Add(workers[i] != workers[j]).OnlyEnforceIf(same.Not())
+                before, interrupted, after, interrupts = [model.NewBoolVar(f"order[{i},{j},{k}]") for k in range(4)]
+                # The same-worker pair has exactly one of four regions. A
+                # prefill cannot straddle another prefill, or the final decode
+                # step. Consequently an interruption counts its FULL duration.
+                model.Add(before + interrupted + after + interrupts == same)
+                model.Add(ends[i] <= starts[j]).OnlyEnforceIf(before)
+                model.Add(prefill_ends[i] <= starts[j]).OnlyEnforceIf(interrupted)
+                model.Add(prefill_ends[j] + 1 <= ends[i]).OnlyEnforceIf(interrupted)
+                model.Add(ends[j] <= starts[i]).OnlyEnforceIf(after)
+                model.Add(prefill_ends[j] <= starts[i]).OnlyEnforceIf(interrupts)
+                model.Add(prefill_ends[i] + 1 <= ends[j]).OnlyEnforceIf(interrupts)
+                for receiver, provider, condition in [(i, j, interrupted), (j, i, interrupts)]:
+                    pause = model.NewIntVar(0, prefill_latency(trace[provider].isl), f"blocked[{receiver},{provider}]")
+                    model.Add(pause == prefill_durations[provider]).OnlyEnforceIf(condition)
+                    model.Add(pause == 0).OnlyEnforceIf(condition.Not())
+                    blocked[receiver].append(pause)
+        for i, u in enumerate(trace):
+            model.Add(ends[i] == prefill_ends[i] + u.osl + sum(blocked[i]))
+            if u.osl == 0:
+                model.Add(ends[i] == prefill_ends[i])
 
     evicts, providers = [], []
     for i, u in enumerate(trace):
@@ -190,8 +232,9 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, obje
     ttfts, e2es = [], []
     for i, u in enumerate(trace):
         ttft = model.NewIntVar(0, horizon, f"ttft[{i}]")
-        # Weird, we can equivalently write ttft = prefill_ends[i] - releases[i] but that confuses the solver...
-        model.Add(ttft == ends[i] - u.osl - releases[i])
+        # Preserve the baseline expression; with pauses, end - output_length
+        # includes blocked time and TTFT must use prefill completion directly.
+        model.Add(ttft == (prefill_ends[i] if exclusive_prefill else ends[i] - u.osl) - releases[i])
         ttfts.append(ttft)
         e2e = model.NewIntVar(0, horizon, f"e2e[{i}]")
         model.Add(e2e == ends[i] - releases[i])
@@ -212,16 +255,18 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, obje
 
     return model, dict(routes=routes, starts=starts, ends=ends, prefill_ends=prefill_ends, reuses=reuses, releases=releases,
                        evicts=evicts, providers=providers, ttfts=ttfts, e2es=e2es, quantile=quantile,
-                       objective=objective, metric=metric)
+                       objective=objective, metric=metric, exclusive_prefill=exclusive_prefill, blocked=blocked)
 
 class GapLogger(cp_model.CpSolverSolutionCallback):
     def on_solution_callback(self):
         obj, bound = self.ObjectiveValue(), self.BestObjectiveBound()
         print(f"[{self.WallTime():.1f}s] obj={obj:.0f} bound={bound:.0f} gap={(obj - bound) / max(abs(obj), 1):.1%}")
 
-def solve(model, vars, objective="mean", num_workers=0):
+def solve(model, vars, objective="mean", num_workers=0, time_limit=None):
     solver = cp_model.CpSolver()
     solver.parameters.num_workers = num_workers
+    if time_limit is not None:
+        solver.parameters.max_time_in_seconds = time_limit
     status = solver.Solve(model, GapLogger())
     print(solver.StatusName(status))
 
@@ -250,12 +295,27 @@ def dump_schedule(config, trace, blk_size, solver, status, vars, prefill_latency
             hit=0 if src is None else shared_tokens(trace[src], v, blk_size), prefill_full=prefill_latency(v.isl),
             ttft=value(vars["ttfts"][j]), e2e=value(vars["e2es"][j]),
             evict=value(vars["evicts"][j]) if value(vars["providers"][j]) else None))
+    if vars["exclusive_prefill"]:
+        for r in requests:
+            cursor, segments = r["prefill_end"], []
+            for other in sorted(requests, key=lambda q: q["start"]):
+                if other["cache"] != r["cache"] or other["prefill_end"] <= cursor or other["start"] >= r["end"]:
+                    continue
+                if cursor < other["start"]:
+                    segments.append([cursor, other["start"]])
+                cursor = other["prefill_end"]
+            if cursor < r["end"]:
+                segments.append([cursor, r["end"]])
+            r["decode_segments"] = segments
+            r["decode_pause"] = r["end"] - r["prefill_end"] - r["osl"]
     output_dir = Path(__file__).resolve().parent / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / f"schedule_{config}_{vars['metric']}.json"
+    mode = "_aggregate" if vars["exclusive_prefill"] else ""
+    path = output_dir / f"schedule_{config}{mode}_{vars['metric']}.json"
     with open(path, "w") as f:
         json.dump(dict(params=prefill_latency.config, decode_ms=prefill_latency.decode_ms, blk_size=blk_size,
                        status=solver.StatusName(status), metric=vars["metric"], objective=vars["objective"],
+                       exclusive_prefill=vars["exclusive_prefill"],
                        obj=solver.ObjectiveValue(), bound=solver.BestObjectiveBound(),
                        requests=requests), f, indent=1)
     print("\nWrote", path)
@@ -264,9 +324,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Optimize cache placements for TTFT or end-to-end latency.")
     parser.add_argument("--metric", choices=("ttft", "e2e"), default="e2e", help="latency to optimize (default: e2e)")
     parser.add_argument("--objective", choices=("mean", "p90"), default="p90", help="aggregation (default: p90)")
+    parser.add_argument("--exclusive-prefill", action="store_true", help="pause decode using whole-prefill overlap constraints")
+    parser.add_argument("--time-limit", type=float, default=None, help="solver seconds (default: unlimited)")
+    parser.add_argument("--num-workers", type=int, default=4, help="CP-SAT search threads (default: 4)")
+    parser.add_argument("--requests", type=int, default=128)
+    parser.add_argument("--trace", default="traces/mooncake_conversation.jsonl")
     args = parser.parse_args()
-    num_requests = 128
-    trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
+    if args.requests <= 0 or args.num_workers <= 0 or (args.time_limit is not None and args.time_limit <= 0):
+        parser.error("requests, num-workers, and time-limit must be positive")
+    num_requests = args.requests
+    trace, blk_size = from_mooncake(args.trace, n=num_requests)
 
     # num_requests = 512
     num_caches = 4
@@ -278,11 +345,17 @@ if __name__ == "__main__":
     # trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=num_requests, stagger_s=stagger_s)
 
     print("Total requests: ", len(trace))
-    model, vars = build_model(trace, blk_size, num_caches=num_caches, mem=default_latency.kv_capacity, horizon=10_000_000,
-                              prefill_latency=default_latency, objective=objective, metric=args.metric)
+    # A cold serial schedule after the last external arrival is a safe bound.
+    horizon = max(u.arrival or 0 for u in trace) + sum(default_latency(u.isl) + u.osl + u.think for u in trace) + 1
+    model, vars = build_model(trace, blk_size, num_caches=num_caches, mem=default_latency.kv_capacity, horizon=horizon,
+                              prefill_latency=default_latency, objective=objective, metric=args.metric,
+                              exclusive_prefill=args.exclusive_prefill)
     print("Built model, beginning solve...")
-    solver, status = solve(model, vars, objective)
+    solver, status = solve(model, vars, objective, num_workers=args.num_workers, time_limit=args.time_limit)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        compare(trace, blk_size, solver, vars, default_latency, objective)
-        dump_schedule(f"{num_caches}c_{sessions}s_{len(trace)}r_{stagger_s}st_{default_latency.config.split('-')[0]}",
+        if args.exclusive_prefill:
+            print("Mocker comparison skipped: its replay does not enforce exclusive prefill.")
+        else:
+            compare(trace, blk_size, solver, vars, default_latency, objective)
+        dump_schedule(f"{Path(args.trace).stem}_{num_caches}c_{len(trace)}r_{args.objective}_{default_latency.config.split('-')[0]}",
                       trace, blk_size, solver, status, vars, default_latency)

@@ -110,6 +110,8 @@ def mocker_e2e_ms(record):
 
 
 def compare(trace, blk_size, solver, vars, prefill_latency, objective="mean", mocker_runs=3):
+    if vars.get("exclusive_prefill"):
+        raise ValueError("Mocker comparison does not support exclusive-prefill schedules")
     metric = vars["metric"]
     mocker_latency = mocker_e2e_ms if metric == "e2e" else lambda q: q["ttft_ms"]
     dt = prefill_latency.decode_ms
