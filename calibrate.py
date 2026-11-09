@@ -78,26 +78,40 @@ def run_mocker(rows, workers, block_size, p):
 
 
 # objective is "mean" or a nearest-rank quantile in (0, 1), as in cache_packing.build_model
-def summarize(ttfts, objective="mean"):
+def summarize(latencies, objective="mean"):
     if objective == "mean":
-        return sum(ttfts) / len(ttfts)
-    return sorted(ttfts)[ceil(objective * len(ttfts)) - 1]
+        return sum(latencies) / len(latencies)
+    return sorted(latencies)[ceil(objective * len(latencies)) - 1]
 
 
 # Mocker's decisions in Soldr's cost model
-def soldr_ttft(rows, recs, prefill_latency, objective="mean"):
-    free, ttfts = {}, []
+def soldr_latency(rows, recs, prefill_latency, objective="mean", metric="e2e"):
+    if metric not in ("ttft", "e2e"):
+        raise ValueError("metric must be 'ttft' or 'e2e'")
+    free, latencies = {}, []
     # In the order Mocker sent the requests (in a closed-loop replay, this depends on Mocker's own timing)
     for r, q in sorted(zip(rows, recs), key=lambda rq: rq[1]["arrival_time_ms"]):
         arrival = int(q["arrival_time_ms"]) // prefill_latency.decode_ms
         c = q["decode_worker_idx"]
         start = max(arrival, free.get(c, arrival))
         free[c] = start + prefill_latency(r["input_length"], q["reused_input_tokens"])
-        ttfts.append(free[c] - arrival)
-    return summarize(ttfts, objective)
+        # Decode overlaps other prefills; it must not advance the worker's prefill clock.
+        latencies.append(free[c] - arrival + (r["output_length"] if metric == "e2e" else 0))
+    return summarize(latencies, objective)
+
+
+def soldr_ttft(rows, recs, prefill_latency, objective="mean"):
+    # Prefill calibration still fits TTFT, independently of the optimization objective.
+    return soldr_latency(rows, recs, prefill_latency, objective, metric="ttft")
+
+
+def mocker_e2e_ms(record):
+    return record["last_token_ms"] - record["arrival_time_ms"]
 
 
 def compare(trace, blk_size, solver, vars, prefill_latency, objective="mean", mocker_runs=3):
+    metric = vars["metric"]
+    mocker_latency = mocker_e2e_ms if metric == "e2e" else lambda q: q["ttft_ms"]
     dt = prefill_latency.decode_ms
     rows = [{"timestamp": (u.arrival or 0) * dt, "input_length": u.isl, "output_length": u.osl, "hash_ids": u.hash_ids}
             for u in trace]
@@ -108,7 +122,7 @@ def compare(trace, blk_size, solver, vars, prefill_latency, objective="mean", mo
     for c in set(route):
         ix = sorted((j for j in range(len(rows)) if route[j] == c), key=lambda j: (submit[j], j))
         for j, q in zip(ix, run_mocker([rows[j] | {"timestamp": submit[j]} for j in ix], 1, blk_size, prefill_latency)):
-            soldr_mocker[j] = submit[j] - release[j] + q["ttft_ms"]
+            soldr_mocker[j] = submit[j] - release[j] + mocker_latency(q)
 
     if any(u.prev is not None for u in trace):
         session = []
@@ -122,13 +136,14 @@ def compare(trace, blk_size, solver, vars, prefill_latency, objective="mean", mo
                          dependencies=deps(u))
                 for j, (r, u) in enumerate(zip(rows, trace))]
 
-    score = lambda recs: (soldr_ttft(rows, recs, prefill_latency, objective),
-                          summarize([q["ttft_ms"] / dt for q in recs], objective))
+    score = lambda recs: (soldr_latency(rows, recs, prefill_latency, objective, metric),
+                          summarize([mocker_latency(q) / dt for q in recs], objective))
     mocker = [score(run_mocker(rows, len(vars["routes"][0]), blk_size, prefill_latency)) for _ in range(mocker_runs)]
-    soldr_soldr = summarize([solver.Value(t) for t in vars["ttfts"]], objective)
+    soldr_soldr = summarize([solver.Value(t) for t in vars["ttfts" if metric == "ttft" else "e2es"]], objective)
     table = [("Soldr decisions", soldr_soldr, summarize([t / dt for t in soldr_mocker], objective)),
              ("Mocker decisions", sum(s for s, _ in mocker) / mocker_runs, sum(m for _, m in mocker) / mocker_runs)]
-    label = "Avg TTFT" if objective == "mean" else f"P{objective * 100:g} TTFT"
+    label = f"Avg {metric.upper()}" if objective == "mean" else f"P{objective * 100:g} {metric.upper()}"
+    print(f"Latency in steps ({dt} ms/step)")
     print(f"{label:18s} {'Soldr':>7s} {'Mocker':>7s}")
     for name, soldr, mock in table:
         print(f"{name:18s} {soldr:7.1f} {mock:7.1f}")

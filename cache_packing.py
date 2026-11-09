@@ -1,3 +1,4 @@
+import argparse
 import json
 from dataclasses import dataclass, replace
 from itertools import islice
@@ -74,8 +75,10 @@ def shared_tokens(u, v, blk_size):
 def saving(u, v, blk_size, prefill_latency=default_latency):
     return prefill_latency(v.isl) - prefill_latency(v.isl, shared_tokens(u, v, blk_size))
 
-# objective is "mean" (sum of TTFTs) or a quantile in (0, 1), e.g. 0.9 for p90 TTFT
-def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, objective="mean"):
+# metric selects TTFT or E2E; objective aggregates it as a mean or quantile (e.g. 0.9).
+def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, objective="mean", metric="e2e"):
+    if metric not in ("ttft", "e2e"):
+        raise ValueError("metric must be 'ttft' or 'e2e'")
     N, C = len(trace), num_caches
     assert mem >= max([u.isl + u.osl for u in trace])
     for u in trace:
@@ -184,27 +187,32 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency, obje
     #     waits.append(wait)
     # model.minimize(sum(waits))
 
-    ttfts = []
+    ttfts, e2es = [], []
     for i, u in enumerate(trace):
         ttft = model.NewIntVar(0, horizon, f"ttft[{i}]")
         # Weird, we can equivalently write ttft = prefill_ends[i] - releases[i] but that confuses the solver...
         model.Add(ttft == ends[i] - u.osl - releases[i])
         ttfts.append(ttft)
+        e2e = model.NewIntVar(0, horizon, f"e2e[{i}]")
+        model.Add(e2e == ends[i] - releases[i])
+        e2es.append(e2e)
 
+    latencies = ttfts if metric == "ttft" else e2es
     quantile = None
     if objective == "mean":
-        model.minimize(sum(ttfts))
+        model.minimize(sum(latencies))
     else:
         k = ceil(objective * N)
         quantile = model.NewIntVar(0, horizon, "quantile")
         lates = [model.NewBoolVar(f"late[{i}]") for i in range(N)]
-        for ttft, late in zip(ttfts, lates):
-            model.Add(ttft <= quantile).OnlyEnforceIf(late.Not())
+        for latency, late in zip(latencies, lates):
+            model.Add(latency <= quantile).OnlyEnforceIf(late.Not())
         model.Add(sum(lates) <= N - k)
         model.minimize(quantile)
 
     return model, dict(routes=routes, starts=starts, ends=ends, prefill_ends=prefill_ends, reuses=reuses, releases=releases,
-                       evicts=evicts, providers=providers, ttfts=ttfts, quantile=quantile)
+                       evicts=evicts, providers=providers, ttfts=ttfts, e2es=e2es, quantile=quantile,
+                       objective=objective, metric=metric)
 
 class GapLogger(cp_model.CpSolverSolutionCallback):
     def on_solution_callback(self):
@@ -218,11 +226,12 @@ def solve(model, vars, objective="mean", num_workers=0):
     print(solver.StatusName(status))
 
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        metric = vars["metric"]
         if objective == "mean":
-            ttfts = vars["ttfts"]
-            print("Avg TTFT: ", sum(solver.Value(t) for t in ttfts) / len(ttfts))
+            latencies = vars["ttfts" if metric == "ttft" else "e2es"]
+            print(f"Avg {metric.upper()} (steps): ", sum(solver.Value(t) for t in latencies) / len(latencies))
         else:
-            print(f"P{objective * 100:g} TTFT: ", solver.Value(vars["quantile"]))
+            print(f"P{objective * 100:g} {metric.upper()} (steps): ", solver.Value(vars["quantile"]))
 
         if status != cp_model.OPTIMAL:
             obj, bound = solver.ObjectiveValue(), solver.BestObjectiveBound()
@@ -239,17 +248,23 @@ def dump_schedule(config, trace, blk_size, solver, status, vars, prefill_latency
             isl=v.isl, osl=v.osl, release=value(vars["releases"][j]), start=value(vars["starts"][j]),
             prefill_end=value(vars["prefill_ends"][j]), end=value(vars["ends"][j]), src=src,
             hit=0 if src is None else shared_tokens(trace[src], v, blk_size), prefill_full=prefill_latency(v.isl),
-            ttft=value(vars["ttfts"][j]), evict=value(vars["evicts"][j]) if value(vars["providers"][j]) else None))
+            ttft=value(vars["ttfts"][j]), e2e=value(vars["e2es"][j]),
+            evict=value(vars["evicts"][j]) if value(vars["providers"][j]) else None))
     output_dir = Path(__file__).resolve().parent / "outputs"
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / f"schedule_{config}.json"
+    path = output_dir / f"schedule_{config}_{vars['metric']}.json"
     with open(path, "w") as f:
         json.dump(dict(params=prefill_latency.config, decode_ms=prefill_latency.decode_ms, blk_size=blk_size,
-                       status=solver.StatusName(status), obj=solver.ObjectiveValue(), bound=solver.BestObjectiveBound(),
+                       status=solver.StatusName(status), metric=vars["metric"], objective=vars["objective"],
+                       obj=solver.ObjectiveValue(), bound=solver.BestObjectiveBound(),
                        requests=requests), f, indent=1)
     print("\nWrote", path)
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Optimize cache placements for TTFT or end-to-end latency.")
+    parser.add_argument("--metric", choices=("ttft", "e2e"), default="e2e", help="latency to optimize (default: e2e)")
+    parser.add_argument("--objective", choices=("mean", "p90"), default="p90", help="aggregation (default: p90)")
+    args = parser.parse_args()
     num_requests = 128
     trace, blk_size = from_mooncake("traces/mooncake_conversation.jsonl", n=num_requests)
 
@@ -258,13 +273,13 @@ if __name__ == "__main__":
     sessions = 16 * num_caches
     # 900 s is the average session length for Weka
     stagger_s = 900 // sessions
-    objective = 0.90
+    objective = "mean" if args.objective == "mean" else 0.90
 
     # trace, blk_size = from_weka("traces/weka_256k.jsonl", sessions=sessions, n=num_requests, stagger_s=stagger_s)
 
     print("Total requests: ", len(trace))
     model, vars = build_model(trace, blk_size, num_caches=num_caches, mem=default_latency.kv_capacity, horizon=10_000_000,
-                              prefill_latency=default_latency, objective=objective)
+                              prefill_latency=default_latency, objective=objective, metric=args.metric)
     print("Built model, beginning solve...")
     solver, status = solve(model, vars, objective)
     if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):

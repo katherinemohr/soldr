@@ -1,7 +1,7 @@
 """Create a standalone placement viewer (no server or extra packages needed).
 
     python3 visualization/visualize_schedule.py
-    python3 visualization/visualize_schedule.py outputs/schedule_synthetic_four_prefixes_mean.json
+    python3 visualization/visualize_schedule.py outputs/schedule_synthetic_four_prefixes_mean_e2e.json
     python3 visualization/visualize_schedule.py outputs/schedule.json --trace trace.jsonl --output view.html
 
 With no paths, includes all schedule_*.json files in the repository's outputs/.
@@ -57,7 +57,7 @@ def main():
         parser.error("--trace requires exactly one schedule")
     datasets = [prepare(path, args.trace) for path in paths]
     # Prefer the controlled four-prefix example as the landing view.
-    datasets.sort(key=lambda d: (d["name"] != "synthetic_four_prefixes_mean", d["name"]))
+    datasets.sort(key=lambda d: (d["name"] != "synthetic_four_prefixes_mean_e2e", d["name"]))
     payload = json.dumps(datasets).replace("<", "\\u003c").replace("&", "\\u0026")
     template = Path(__file__).with_name("placement_viewer.html").read_text()
     args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -3,6 +3,7 @@
 Run from the repository root:
     .venv/bin/python synthetic_traces.py --solve
     .venv/bin/python synthetic_traces.py --solve --case four_prefixes --objective p90
+    .venv/bin/python synthetic_traces.py --solve --case four_prefixes --metric ttft
     .venv/bin/python synthetic_traces.py --solve --wave-ms 1200
 
 Each trace has 16 requests: four waves of four, 60 ms apart by default,
@@ -15,8 +16,9 @@ distinct_prefixes: no shared blocks between requests.
 four_prefixes: four independent 7,680-token prefixes, each followed by a
 unique 512-token suffix. Request i belongs to group i % 4.
 
-Mean TTFT is the default because p90 may leave some requests unoptimized.
-Schedules are saved as outputs/schedule_synthetic_<case>_<objective>.json.
+Mean end-to-end latency is the default because p90 may leave some requests unoptimized.
+Use --metric ttft to optimize time to first token instead.
+Schedules are saved as outputs/schedule_synthetic_<case>_<objective>_<metric>.json.
 """
 
 import argparse
@@ -73,7 +75,7 @@ def solve_case(case, trace, rows, block_size, args):
     horizon = max(r.arrival for r in trace) + sum(latency(r.isl) + r.osl for r in trace) + 1
     model, variables = packing.build_model(
         trace, block_size, num_caches=NUM_WORKERS, mem=latency.kv_capacity,
-        horizon=horizon, prefill_latency=latency, objective=objective,
+        horizon=horizon, prefill_latency=latency, objective=objective, metric=args.metric,
     )
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = args.time_limit
@@ -94,9 +96,9 @@ def solve_case(case, trace, rows, block_size, args):
     print("  group -> {worker: request count}")
     for group, counts in sorted(groups.items()):
         print(f"    {group}: {dict(sorted(counts.items()))}")
-    ttfts = [solver.Value(t) for t in variables["ttfts"]]
+    latencies = [solver.Value(t) for t in variables["ttfts" if args.metric == "ttft" else "e2es"]]
     hits = sum(solver.Value(v) for rs in variables["reuses"] for v in rs)
-    print(f"  mean TTFT={sum(ttfts) / len(ttfts) * latency.decode_ms:.1f} ms; "
+    print(f"  mean {args.metric.upper()}={sum(latencies) / len(latencies) * latency.decode_ms:.1f} ms; "
           f"requests reusing a prefix={hits}/{len(trace)}")
     if case == "four_prefixes":
         colocated = all(len(counts) == 1 for counts in groups.values())
@@ -118,6 +120,7 @@ def main():
     parser.add_argument("--case", choices=("all", *CASES), default="all")
     parser.add_argument("--solve", action="store_true", help="also run the cache-packing optimizer")
     parser.add_argument("--objective", choices=("mean", "p90"), default="mean")
+    parser.add_argument("--metric", choices=("ttft", "e2e"), default="e2e", help="latency to optimize (default: e2e)")
     parser.add_argument("--time-limit", type=float, default=30, help="solver seconds per case")
     parser.add_argument("--wave-ms", type=int, default=WAVE_MS,
                         help="milliseconds between waves; 0 for a simultaneous burst (default: 60)")
