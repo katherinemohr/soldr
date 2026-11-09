@@ -1,4 +1,5 @@
 import json
+import os
 from dataclasses import dataclass
 from itertools import islice
 from math import ceil
@@ -72,13 +73,21 @@ def transfer_steps(isl, transfer_bw):
 
 def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency,
                 num_prefill=None, num_decode=None, mem_prefill=None, mem_decode=None,
-                transfer_bw=0, makespan_weight=1):
+                transfer_bw=0):
     N, C = len(trace), num_caches
-    # Prefill and decode pools are sized independently. The defaults reproduce the
-    # monolithic configuration: one prefill and one decode worker per cache slot,
-    # sharing the single memory budget.
-    P = C if num_prefill is None else num_prefill
-    D = C if num_decode is None else num_decode
+    # The prefill and decode pools share the cluster, so by default they split the C
+    # cache slots between them. Keeping P + D = C preserves the worker count, and
+    # since each worker still gets `mem`, the total memory budget as well. Pass
+    # num_prefill or num_decode to override; the other one fills up to C.
+    if num_prefill is None and num_decode is None:
+        P, D = (C + 1) // 2, C // 2
+    elif num_prefill is None:
+        D, P = num_decode, C - num_decode
+    elif num_decode is None:
+        P, D = num_prefill, C - num_prefill
+    else:
+        P, D = num_prefill, num_decode
+    assert P >= 1 and D >= 1, f"need one prefill and one decode worker, got P={P} D={D}"
     mem_p = mem if mem_prefill is None else mem_prefill
     mem_d = mem if mem_decode is None else mem_decode
     assert mem_p >= max(u.isl for u in trace)
@@ -229,14 +238,14 @@ def build_model(trace, blk_size, num_caches, mem, horizon, prefill_latency,
         model.Add(latency == dends[i] - u.arrival)
         latencies.append(latency)
 
-    # Nothing else rewards finishing a decode early, so the solver is free to park
-    # generations at the end of the horizon. Penalise the makespan to prevent that.
+    # Makespan is reported as a diagnostic only; it is not scored. Bind it with an
+    # equality (not a one-sided >=) so it is meaningful even though nothing minimises it.
     makespan = model.NewIntVar(0, horizon, "makespan")
-    for i in range(N):
-        model.Add(makespan >= dends[i])
+    model.AddMaxEquality(makespan, dends)
 
-    # Minimise N * (average latency + makespan_weight * makespan), kept integral
-    model.minimize(sum(latencies) + N * makespan_weight * makespan)
+    # Minimise total latency, i.e. N * average latency, kept integral. The trace length
+    # is fixed, so the N factor does not change the argmin.
+    model.minimize(sum(latencies))
 
     # routes/starts/ends are the prefill-side aliases that the runtime comparison
     # consumes; the PD solve keys are exposed alongside them.
@@ -255,7 +264,7 @@ class GapLogger(cp_model.CpSolverSolutionCallback):
 def solve(model, vars):
     solver = cp_model.CpSolver()
     # Cap the run so it always ends with a bound to report
-    solver.parameters.max_time_in_seconds = 5 * 60
+    solver.parameters.max_time_in_seconds = float(os.environ.get("SOLVER_MAX_TIME", 5 * 60))
     status = solver.Solve(model, GapLogger())
     print(solver.StatusName(status))
 
