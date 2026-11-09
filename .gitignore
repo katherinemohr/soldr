@@ -2,5 +2,6 @@ __pycache__/
 *.pyc
 .DS_Store
 traces/weka_256k.jsonl
+traces/synthetic/
 .venv/
 outputs/
