@@ -9,10 +9,14 @@
 # Dynamo (the Mocker and its KV router) and aisimulate (the Mocker's engine) have no macOS wheels, so this builds them
 # from source. That needs a Rust toolchain (https://rustup.rs) and protoc (brew install protobuf), and takes about
 # 20 minutes the first time.
-ai-dynamo @ git+https://github.com/ai-dynamo/dynamo@a83f4796b66151c0c3fd2659fbdb8b0bb9d9b341
-ai-dynamo-runtime @ git+https://github.com/ai-dynamo/dynamo@a83f4796b66151c0c3fd2659fbdb8b0bb9d9b341#subdirectory=lib/bindings/python
-# Same day as the aisimulate-core crate that Dynamo's Mocker compiles in (0.13.0-dev.202610060000000067)
-aisimulate @ git+https://github.com/ai-dynamo/aisimulate@8a709362b5f0692d263eceab4cba0a13790fe138#subdirectory=python/aisimulate
+#
+# Dynamo pins an exact aisimulate-core nightly from crates.io, and old nightlies get deleted, so a Dynamo commit
+# stops building once its nightly is gone. If cargo can't find aisimulate-core, move to a Dynamo commit whose pin
+# is still published (https://index.crates.io/ai/si/aisimulate-core).
+ai-dynamo @ git+https://github.com/ai-dynamo/dynamo@de80aabb58a96a0424b68ce9d1b83b7c59552800
+ai-dynamo-runtime @ git+https://github.com/ai-dynamo/dynamo@de80aabb58a96a0424b68ce9d1b83b7c59552800#subdirectory=lib/bindings/python
+# Same day as the aisimulate-core crate that Dynamo's Mocker compiles in (0.13.0-dev.202610160000000073)
+aisimulate @ git+https://github.com/ai-dynamo/aisimulate@d9bd2b30751a325d5032a7f8413e7b8a8d868421#subdirectory=python/aisimulate
 ortools==9.15.6755
 # ortools 9.15 needs protobuf 6.33.x. grpcio-tools (pulled in by aisimulate's google-vizier) needs protobuf 7 from
 # 1.83 on, so pin it to the last release that accepts 6.33.

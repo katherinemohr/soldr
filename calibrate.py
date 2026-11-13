@@ -84,19 +84,44 @@ def summarize(ttfts, objective="mean"):
     return sorted(ttfts)[ceil(objective * len(ttfts)) - 1]
 
 
-# Mocker's decisions in Soldr's cost model
-def soldr_ttft(rows, recs, prefill_latency, objective="mean"):
-    free, ttfts = {}, []
+# Mocker's TPOT in timesteps over the osl - 1 tokens after the first (None for osl = 1)
+def mocker_tpot(q, dt):
+    if q["output_length"] > 1:
+        return (q["last_token_ms"] - q["first_token_ms"]) / (q["output_length"] - 1) / dt
+
+
+# Mocker's decisions in Soldr's cost model: per-request TTFT and TPOT (None for osl = 1) in timesteps
+def soldr_latencies(rows, recs, prefill_latency):
+    free, prefills, placed = {}, defaultdict(list), []
     # In the order Mocker sent the requests (in a closed-loop replay, this depends on Mocker's own timing)
     for r, q in sorted(zip(rows, recs), key=lambda rq: rq[1]["arrival_time_ms"]):
         arrival = int(q["arrival_time_ms"]) // prefill_latency.decode_ms
         c = q["decode_worker_idx"]
         start = max(arrival, free.get(c, arrival))
         free[c] = start + prefill_latency(r["input_length"], q["reused_input_tokens"])
-        ttfts.append(free[c] - arrival)
-    return summarize(ttfts, objective)
+        prefills[c].append((start, free[c]))
+        placed.append((c, len(prefills[c]) - 1, arrival, r["output_length"]))
+    ttfts, tpots = [], []
+    for c, k, arrival, osl in placed:
+        prefill_end = prefills[c][k][1]
+        ttfts.append(prefill_end - arrival)
+        # Decode stalls for each later prefill on the cache that starts before it's done
+        end = prefill_end + osl
+        for s, e in prefills[c][k + 1:]:
+            if s >= end:
+                break
+            end += e - s
+        tpots.append((end - prefill_end - 1) / (osl - 1) if osl > 1 else None)
+    return ttfts, tpots
 
 
+def soldr_ttft(rows, recs, prefill_latency, objective="mean"):
+    return summarize(soldr_latencies(rows, recs, prefill_latency)[0], objective)
+
+
+# Prints TTFT and TPOT, as predicted by Soldr's model and as measured in Mocker, for Soldr's schedule and for Mocker's
+# own routing. Returns Mocker's per-request TTFT and TPOT (None for osl = 1) for Soldr's schedule, in timesteps.
+# objective is "mean" or a nearest-rank quantile in (0, 1), as in cache_packing.build_model
 def compare(trace, blk_size, solver, vars, prefill_latency, objective="mean", mocker_runs=3):
     dt = prefill_latency.decode_ms
     rows = [{"timestamp": (u.arrival or 0) * dt, "input_length": u.isl, "output_length": u.osl, "hash_ids": u.hash_ids}
@@ -104,11 +129,12 @@ def compare(trace, blk_size, solver, vars, prefill_latency, objective="mean", mo
     route = [next(c for c, r in enumerate(rs) if solver.Value(r)) for rs in vars["routes"]]
     submit = [solver.Value(s) * dt for s in vars["starts"]]
     release = [solver.Value(r) * dt for r in vars["releases"]]
-    soldr_mocker = [0.0] * len(rows)
+    observed = dict(ttfts=[None] * len(rows), tpots=[None] * len(rows))
     for c in set(route):
         ix = sorted((j for j in range(len(rows)) if route[j] == c), key=lambda j: (submit[j], j))
         for j, q in zip(ix, run_mocker([rows[j] | {"timestamp": submit[j]} for j in ix], 1, blk_size, prefill_latency)):
-            soldr_mocker[j] = submit[j] - release[j] + q["ttft_ms"]
+            observed["ttfts"][j] = (submit[j] - release[j] + q["ttft_ms"]) / dt
+            observed["tpots"][j] = mocker_tpot(q, dt)
 
     if any(u.prev is not None for u in trace):
         session = []
@@ -122,16 +148,37 @@ def compare(trace, blk_size, solver, vars, prefill_latency, objective="mean", mo
                          dependencies=deps(u))
                 for j, (r, u) in enumerate(zip(rows, trace))]
 
-    score = lambda recs: (soldr_ttft(rows, recs, prefill_latency, objective),
-                          summarize([q["ttft_ms"] / dt for q in recs], objective))
+    # In ms, skipping undefined TPOTs
+    summary = lambda xs: summarize([x for x in xs if x is not None], objective) * dt
+
+    def score(recs):
+        ttfts, tpots = soldr_latencies(rows, recs, prefill_latency)
+        return (summary(ttfts), summary([q["ttft_ms"] / dt for q in recs]),
+                summary(tpots), summary([mocker_tpot(q, dt) for q in recs]))
     mocker = [score(run_mocker(rows, len(vars["routes"][0]), blk_size, prefill_latency)) for _ in range(mocker_runs)]
-    soldr_soldr = summarize([solver.Value(t) for t in vars["ttfts"]], objective)
-    table = [("Soldr decisions", soldr_soldr, summarize([t / dt for t in soldr_mocker], objective)),
-             ("Mocker decisions", sum(s for s, _ in mocker) / mocker_runs, sum(m for _, m in mocker) / mocker_runs)]
-    label = "Avg TTFT" if objective == "mean" else f"P{objective * 100:g} TTFT"
-    print(f"{label:18s} {'Soldr':>7s} {'Mocker':>7s}")
-    for name, soldr, mock in table:
-        print(f"{name:18s} {soldr:7.1f} {mock:7.1f}")
+
+    value = solver.Value
+    predicted = dict(ttfts=[value(t) for t in vars["ttfts"]],
+                     tpots=[(value(e) - value(pe) - 1) / (u.osl - 1) if u.osl > 1 else None
+                            for u, pe, e in zip(trace, vars["prefill_ends"], vars["ends"])])
+    table = [("Soldr decisions", summary(predicted["ttfts"]), summary(observed["ttfts"]),
+              summary(predicted["tpots"]), summary(observed["tpots"])),
+             ("Mocker decisions", *(sum(col) / mocker_runs for col in zip(*mocker)))]
+    label = "Avg (ms)" if objective == "mean" else f"P{objective * 100:g} (ms)"
+    print(f"\nSoldr: predicted by Soldr's model. Mocker: measured in Mocker.")
+    print(f"{label:18s} {'TTFT':>15s} {'TPOT':>15s}")
+    print(f"{'':18s} {'Soldr':>7s} {'Mocker':>7s} {'Soldr':>7s} {'Mocker':>7s}")
+    for name, *cells in table:
+        print(f"{name:18s} " + " ".join(f"{x:7.1f}" if i < 2 else f"{x:7.2f}" for i, x in enumerate(cells)))
+
+    # How far off the prediction is for each of Soldr's requests
+    for metric in ("ttfts", "tpots"):
+        errors = sorted((p - o) * dt for p, o in zip(predicted[metric], observed[metric]) if p is not None)
+        if errors:
+            print(f"Soldr decisions, predicted - measured {metric[:-1].upper()} per request (ms): median "
+                  f"{errors[len(errors) // 2]:.2f}, P10 {errors[len(errors) // 10]:.2f}, "
+                  f"P90 {errors[ceil(0.9 * len(errors)) - 1]:.2f}")
+    return observed
 
 
 def calibrate_ab(p):
