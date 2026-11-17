@@ -1,14 +1,14 @@
 # Cache packing with prefill/decode interference modelling.
-import heapq
 import json
 from bisect import bisect_left
 from dataclasses import dataclass, field
 from math import ceil
 import numpy as np
 from ortools.sat.python import cp_model
-from cache_packing import Request, shared_tokens
+from cache_packing import shared_tokens
+from interference_packing_helper import RollingState, advance_states, build_window_context, session_info
 
-# Coefficients are scaled by S and rounded to integers; each scaled sum is then matched to within S - 1
+# Scaling Coefficient Constant used to account for fractional latency steps.
 S = 100
 
 # finds the intercept of x on a piecewise linear function defined by xs and ys
@@ -19,10 +19,7 @@ def interp(xs, ys, x):
     return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
 
 
-# Step-level latency model of Mocker's engine, from steps_<config>.json. decode_f is f(B) at the measured batch
-# sizes and decode_k the cost per KV token of the decoding requests; prefill_g is g(n) at the measured chunk sizes and
-# prefill_b the attention cost. Fitted by least squares on Mocker runs: decode-only batches (B up to 128, contexts up
-# to 128k, max error 0.5 ms) and single prefills (up to 8192 new tokens after 0-98k cached, max error 0.2 ms).
+# Step-level latency model obtained by running tpot_sim.py, loaded from steps_<config>.json. 
 class StepLatency:
     def __init__(self, config):
         with open(f"steps_{config}.json") as f:
@@ -52,7 +49,7 @@ class StepLatency:
         return self._prefill[key]
 
     def __call__(self, isl, hit, blk_size):
-        # As in Mocker: hits are block-aligned, and at least one token is computed
+        # hits are block-aligned, and at least one token is computed
         return max(1, round(self.prefill_ms(isl, min(hit, isl - 1) // blk_size * blk_size)))
 
 
@@ -68,9 +65,9 @@ default_steps = StepLatency("qwen3-30b-a3b_h100x4")
 #   4) finished - all decisions are final, and the request is not solved in the current window anymore.
 @dataclass
 class Context:
-    # finished_hit_sources[j] = (src, prefill_end, route, end, tokens, size)
-    # A request j in the current window "can" get a cache hit of `tokens` from this finished request `src` on cache `route`; 
-    #  `src`'s prefix of `size` tokens stays in memory from src's end until j starts.
+    # finished_hit_sources[j] = (src, prefill_end, route, end, tokens, max_reused_prefix)
+    # A request j in the current window "can" get a cache hit of `tokens` from the finished request `src` on cache `route`; 
+    #  `src`'s prefix of `max_reused_prefix` tokens stays in memory from src's end until j starts.
     finished_hit_sources: dict = field(default_factory=dict)
     # (route, start, prefill_end) of finished requests' prefills that may still overlap with the current window.
     finished_prefills: list = field(default_factory=list)
@@ -498,9 +495,9 @@ def build_model(trace, blk_size, num_caches, mem, horizon, steps=default_steps, 
     # Also add cache constraints for finshed request in context which may be cache providers 
     # to requests in current window
     users = {}
-    for j, (key, pe, route, end, _, size) in ctx.finished_hit_sources.items():
-        users.setdefault(key, (route, end, size, []))[3].append(j)
-    for key, (route, end, size, js) in users.items():
+    for j, (key, pe, route, end, _, max_reused_prefix) in ctx.finished_hit_sources.items():
+        users.setdefault(key, (route, end, max_reused_prefix, []))[3].append(j)
+    for key, (route, end, max_reused_prefix, js) in users.items():
         used = model.NewBoolVar(f"ext_used[{key}]")
         model.AddMaxEquality(used, [ext_reuses[j] for j in js])
         evict = model.NewIntVar(end, horizon, f"ext_evict[{key}]")
@@ -508,7 +505,7 @@ def build_model(trace, blk_size, num_caches, mem, horizon, steps=default_steps, 
             model.Add(evict >= starts[j]).OnlyEnforceIf(ext_reuses[j])
         length = model.NewIntVar(0, horizon, f"_ext_evict[{key}]")
         intervals[route].append(model.NewOptionalIntervalVar(end, length, evict, used, f"ext_eviction[{key}]"))
-        sizes[route].append(size)
+        sizes[route].append(max_reused_prefix)
     for c in range(C):
         model.AddCumulative(intervals[c], sizes[c], mem)
 
@@ -536,442 +533,151 @@ def build_model(trace, blk_size, num_caches, mem, horizon, steps=default_steps, 
                        evicts=evicts, pair_terms=pair_terms)
 
 
-# NEW: start times for a complete feasible hint. Simulates the closed loop under the model's own rules for the given
-# routes and cache-hit sources (src: a request index, "ext" or None): prefills FIFO per cache by release, interference
-# terms with the model's rounded coefficients, iterated to a fixed point. Starts are padded by `margin` ms so rounding
-# can't make them infeasible. The memory constraint is not simulated.
-# NEW (P-D split): droute is each request's decode cache (None: its prefill cache, colocated); a split request's decode
-# starts after its transfer and runs one more step, as in build_model. full=True returns the simulated times
-# (dict of arrays: starts, prefill_ends, decode_starts, ends, decodes, prefill_slowdowns) instead of the start list.
-def simulate_starts(trace, blk_size, route, src, steps, margin, ctx=None, iters=400, droute=None, full=False):
-    N = len(trace)
-    ctx = ctx or Context()
-    shared = [[shared_tokens(u, v, blk_size) if i != j else 0 for j, v in enumerate(trace)] for i, u in enumerate(trace)]
-    P = lambda isl, hit=0: steps(isl, hit, blk_size)
-    q = {key: np.array(val) for key, val in constants(trace, blk_size, steps, max_hits(trace, shared, ctx)).items()}
-    hit = [ctx.finished_hit_sources[j][4] if s == "ext" else shared[s][j] if s is not None else 0 for j, s in enumerate(src)]
-    prefill = np.array([P(v.isl, h) for v, h in zip(trace, hit)])
-    session = []
-    for u in trace:
-        session.append(len(session) if u.prev is None else session[u.prev])
-    route, session = np.array(route), np.array(session)
-    droute = route if droute is None else np.array(droute)
-    # Pairs that interact, from different sessions: (CHANGED for P-D split) a's decode on b's prefill cache (P-D and
-    # D->P, [a, b]), and decodes on one cache (D-D)
-    other = session[:, None] != session[None, :]
-    inter_pd = (droute[:, None] == route[None, :]) & other
-    inter_dd = (droute[:, None] == droute[None, :]) & other
-    split = droute != route
-    kv_transfer_time = np.where(split, q["kv_transfer_time"], 0)
-    t0, delta, decode_steps = q["t0"], q["delta"], q["decode_steps"]
-    cpd = np.round(S * q["chunk_ms"][None, :] / (q["chunk_ms"][None, :] + t0[:, None]))  # [a, b]: b's prefill, a's decode
-    cdd = np.round(S * delta[None, :] / (t0[:, None] + delta[None, :]))                  # [x, y]: y's decode slows x
-    cap = np.round(S * delta[None, :] * np.minimum.outer(decode_steps, decode_steps))
-    cdp, cany = np.round(S * delta), round(S * (steps.f1 - steps.s))
-    finished_terms = np.array([ctx.finished_interference.get(j, (0, 0, False)) for j in range(N)], float).reshape(N, 3)
-    base = np.round(S * decode_steps * t0) + finished_terms[:, 0] + np.round(S * t0) * split
-    fixed = {}
-    for r, s, e in ctx.finished_prefills:
-        fixed.setdefault(r, []).append((s, e))
-
-    succ = [[] for _ in range(N)]
-    for j, u in enumerate(trace):
-        if u.prev is not None:
-            succ[u.prev].append(j)
-    decode, prefill_slowdown = np.ceil(base / S), np.zeros(N)
-    for _ in range(iters):
-        ends, starts, pe, ds = np.zeros(N), np.zeros(N), np.zeros(N), np.zeros(N)
-        # Closed loop: releases depend on predecessors' ends, so place requests in release order
-        ready = [(u.arrival, j) for j, u in enumerate(trace) if u.prev is None]
-        heapq.heapify(ready)
-        free = {}
-        while ready:
-            rel, j = heapq.heappop(ready)
-            c = route[j]
-            src_pe = ctx.finished_hit_sources[j][1] if src[j] == "ext" else pe[src[j]] if src[j] is not None else -np.inf
-            s = ceil(max(rel, free.get(c, -np.inf), src_pe, ctx.cache_free_at.get(j, {}).get(c, -np.inf))) + margin
-            if split[j] and droute[j] in ctx.cache_free_at.get(j, {}):
-                # NEW (P-D split): nor decode on its decode cache before that cache's finished requests end
-                s = max(s, ceil(ctx.cache_free_at[j][droute[j]] - prefill[j] - prefill_slowdown[j] - kv_transfer_time[j])
-                        + margin)
-            # Skip past finished requests' prefills and fixed-start requests' prefills on the cache
-            moved = j not in ctx.fixed_start
-            if not moved:
-                s = ctx.fixed_start[j]
-            blocked = fixed.get(c, []) + [(ctx.fixed_start[i],
-                                           ctx.fixed_start[i] + prefill[i] + prefill_slowdown[i] + margin)
-                                          for i in ctx.fixed_start if route[i] == c and i != j]
-            while moved:
-                moved = False
-                for fs, fe in blocked:
-                    if s < fe and fs < s + prefill[j] + prefill_slowdown[j] + margin:
-                        s, moved = fe + margin, True
-            starts[j] = s
-            pe[j] = s + prefill[j] + prefill_slowdown[j]
-            ds[j] = pe[j] + kv_transfer_time[j]
-            ends[j] = ds[j] + decode[j]
-            free[c] = max(free.get(c, -np.inf), pe[j])
-            for i in succ[j]:
-                heapq.heappush(ready, (ends[j] + trace[i].think, i))
-        # CHANGED for P-D split: a's decode [ds_a, end_a) overlaps b's prefill [start_b, pe_b), as in build_model
-        overlap_from = np.maximum(ds[:, None], starts[None, :])
-        overlap_to = np.minimum(ends[:, None], pe[None, :])
-        decoding_prefill_overlap = inter_pd & (overlap_from < overlap_to) & (decode_steps[:, None] > 0)
-        decode_prefill_overlap_len = np.where(decoding_prefill_overlap, overlap_to - overlap_from, 0)
-        decode_decode_overlap_len = np.clip(np.minimum.outer(ends, ends) - np.maximum.outer(ds, ds), 0, None)
-        decode_decode_overlap_len = np.where(inter_dd & (decode_steps[:, None] > 0) & (decode_steps[None, :] > 0),
-                                             decode_decode_overlap_len, 0)
-        np.fill_diagonal(decode_decode_overlap_len, 0)
-        new_decode = np.ceil((base + np.minimum(cdd * decode_decode_overlap_len, cap).sum(1)
-                              + (cpd * decode_prefill_overlap_len).sum(1)) / S)
-        any_decoding = decoding_prefill_overlap.any(0) | (finished_terms[:, 2] > 0)
-        new_prefill_slowdown = np.ceil(q["chunks"] * (cany * any_decoding
-                                                      + (cdp[:, None] * decoding_prefill_overlap).sum(0)
-                                                      + finished_terms[:, 1]) / S)
-        change = max(np.abs(new_decode - decode).max(initial=0),
-                     np.abs(new_prefill_slowdown - prefill_slowdown).max(initial=0))
-        if change < 1:
-            break
-        # Damped, so the closed loop settles
-        decode = np.ceil(0.5 * decode + 0.5 * new_decode)
-        prefill_slowdown = np.ceil(0.5 * prefill_slowdown + 0.5 * new_prefill_slowdown)
-    if full:
-        return dict(starts=starts, prefill_ends=pe, decode_starts=ds, ends=ends, decodes=decode,
-                    prefill_slowdowns=prefill_slowdown)
-    return [int(s) for s in starts]
+@dataclass
+class PartialHint:
+    # route[l]: the cache request l prefills on
+    route: list
+    # droute[l]: the cache it decodes on, with topology "split" (None: colocated)
+    droute: list = None
 
 
-# NEW: a complete feasible hint for build_model (every proto variable), from routes and cache-hit sources. Fixes them
-# with simulated starts and lets CP-SAT fill in the rest, widening the margin if that's infeasible. Returns
-# (hint, objective), or (None, None). Partial hints (routes, starts, hits) leave CP-SAT searching for minutes beyond
-# about 96 requests.
-# starts: use these start times instead of simulating.
-# NEW (P-D split): droute: decode caches, for topology "split" (None: colocated); pools as in build_model.
-def full_hint(trace, blk_size, C, mem, horizon, route, src, steps=default_steps, limit=60, margins=(3, 10, 50),
-              ctx=None, starts=None, droute=None, pools=None):
-    N = len(trace)
-    given = starts
-    topology = "colocated" if droute is None else "split"
-    for margin in margins[:1] if given else margins:
-        starts = given or simulate_starts(trace, blk_size, route, src, steps, margin, ctx, droute=droute)
-        m, v = build_model(trace, blk_size, C, mem, horizon, steps, ctx=ctx, topology=topology, pools=pools)
-        for j in range(N):
-            m.Add(v["routes"][j][route[j]] == 1)
-            if droute is not None:
-                m.Add(v["droutes"][j][droute[j]] == 1)
-            if j not in (ctx.fixed_start if ctx else {}):
-                m.Add(v["starts"][j] == starts[j])
-            for i in range(N):
-                m.Add(v["reuses"][i][j] == int(i == src[j]))
-            if j in v["ext_reuses"]:
-                m.Add(v["ext_reuses"][j] == int(src[j] == "ext"))
-        s = cp_model.CpSolver()
-        s.parameters.max_time_in_seconds = limit
-        st = s.Solve(m)
-        if st in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-            return list(s.ResponseProto().solution), s.ObjectiveValue()
-    return None, None
+# get a window's routing hint: use previous decisions, else follow the cache-hit source, else the least busy cache
+def get_cache_routing_partial_hint(state, info, active, index, ctx, C, split, pools=None):
+    solved_vars = state.solved_vars
+    route, running, drunning = [], [0] * C, [0] * C
+    droute = [solved_vars[g]["droute"] if g in solved_vars else None for g in active] if split else None
+    prefill_pool, decode_pool = pools or (range(C), range(C))
+    for g in active:
+        if g in solved_vars:
+            running[solved_vars[g]["route"]] += 1
+            drunning[solved_vars[g].get("droute", solved_vars[g]["route"])] += 1
+    for g in active:
+        l = index[g]
+        if g in solved_vars:
+            route.append(solved_vars[g]["route"])
+        else:
+            cands = [(t, i) for i, t in info.sources[g] if i in index]
+            if cands:
+                i = max(cands)[1]
+                route.append(route[index[i]])
+            elif l in ctx.finished_hit_sources:
+                route.append(ctx.finished_hit_sources[l][2])
+            else:
+                route.append(min(prefill_pool, key=lambda c: running[c]))
+            running[route[-1]] += 1
+    if split:
+        for l, r in enumerate(route):
+            if droute[l] is None:
+                droute[l] = r if r in decode_pool else min(decode_pool, key=lambda c: drunning[c])
+                drunning[droute[l]] += 1
+    return PartialHint(route, droute)
 
 
-# NEW: solves a whole trace (in ms) in windows that advance in solved time. Each window adds up to `window` new
-# requests, those with the earliest estimated release among requests whose predecessor is solved (so at most one new
-# turn per session), solves them with the uncommitted and still-running requests, then commits the `step` uncommitted
-# requests that start first: their cache and cache hit are fixed, and their start once their predecessor is finished
-# (fixing it earlier makes new requests wait for the predecessor to end, since slowing it would move the start;
-# never fixing it lets committed requests move later and never finish). The fallback hint keeps the previous window's
-# starts and places new requests after everything on their cache. Once it ends before every
-# uncommitted request can start, it is finished and leaves the model, leaving constants (Context) for the requests that
-# follow it, take a cache hit from it, or overlapped it. Windows advance in solved time rather than trace order since
-# sessions drift from their recorded timing; in trace order, uncommitted requests can start long before committed
-# ones end, so nothing finishes and windows grow. Each window starts from a complete hint: decisions from the previous
-# window, and for new requests the cache of their cache-hit source (the session's latest prompt), or the cache with the
-# fewest running requests. Returns per request dict(route, start, src, prefill_slowdown, decode, prefill_end, end,
-# release), src a request index or None.
-# NEW (P-D split): topology and pools as in build_model. With "split", results also carry each request's decode cache
-# (droute) and decode start, and new requests are hinted colocated, so any split comes from the solver.
-def solve_rolling(trace, blk_size, C, mem, window, step, limit, steps=default_steps, horizon=None, lookahead=30_000,
-                  log=print, inspect=None, topology="colocated", pools=None):
+def solve_rolling(trace, blk_size, C, mem, window_size, window_step, window_solving_time_limit,
+                  step_latency=default_steps, horizon=None, window_lookahead_time_limit=30_000, log=print,
+                  topology="colocated", pools=None):
     N = len(trace)
     split = topology == "split"
+
     # Everything run back to back, at 3x its uninterrupted decode time
     horizon = horizon or int(max(u.arrival or 0 for u in trace) + sum(
-        u.think + steps(u.isl, 0, blk_size) + 3 * u.osl * (steps.f1 + steps.k * (u.isl + u.osl)) for u in trace))
-    session = []
-    for u in trace:
-        session.append(len(session) if u.prev is None else session[u.prev])
-    members = {}
-    for j, s in enumerate(session):
-        members.setdefault(s, []).append(j)
-    # Cache-hit sources: earlier requests of the session sharing a prefix (hash ids differ across sessions)
-    sources = {j: [(i, t) for i in members[session[j]] if i < j and (t := shared_tokens(trace[i], trace[j], blk_size)) > 0]
-               for j in range(N)}
-    size = [0] * N
-    for j in range(N):
-        for i, t in sources[j]:
-            size[i] = max(size[i], t)
+        u.think + step_latency(u.isl, 0, blk_size) + 3 * u.osl * (step_latency.f1 + step_latency.k * (u.isl + u.osl))
+        for u in trace))
+    
+    info = session_info(trace, blk_size)
 
-    vals, committed, started, finished, finished_interference, uncommitted = {}, set(), set(), set(), {}, []
-    cache_free_at = {}                          # cache -> latest end of its finished requests
-    last = None                                 # previous window: (index map, vars, solver)
+    state = RollingState()
+
+    solved_vars = state.solved_vars
+
     while True:
         # New requests: earliest estimated release among those whose predecessor is solved
-        pool = [j for j in range(N) if j not in vals and (trace[j].prev is None or trace[j].prev in vals)]
-        rel = {j: trace[j].arrival if trace[j].prev is None else vals[trace[j].prev]["end"] + trace[j].think for j in pool}
-        if not pool and not uncommitted:
-            return vals
-        # Earliest any uncommitted request can start: its predecessor's earliest end + think, recursively. A request
-        # ends no earlier than its start (fixed once committed) plus its prefill and decode with no interference, which
-        # only adds time. Solved starts would be tighter but can move earlier, and finishing against them locks in
-        # delays, since nothing may start on a finished request's cache before it ends.
-        # Requests still in the pool count too: they may be released before the window's requests and added later.
-        # Repeated until nothing changes, so a session can advance several turns per window: a fixed start
-        # tightens its successor's bound, which can finish more requests
-        while True:
-            size_started = len(started)
-            lb = {}
-            for j in sorted(set(uncommitted) | set(pool) | (committed - started)):
-                u = trace[j]
-                if u.prev is None:
-                    lb[j] = u.arrival
-                    continue
-                p = trace[u.prev]
-                if u.prev in started:
-                    hit = next((t for i, t in sources[u.prev] if i == vals[u.prev]["src"]), 0)
-                    start = vals[u.prev]["start"]
-                else:
-                    hit = max([t for _, t in sources[u.prev]], default=0)
-                    start = lb[u.prev]
-                lb[j] = start + steps(p.isl, hit, blk_size) + (p.osl - 1) * (steps.f1 + steps.k * (p.isl + p.osl / 2)) \
-                    + u.think - 1
-            T = min(lb.values())
-            # A request is finished once it ends before any request of another session can start (its own session's
-            # later turns can't overlap it, and comparing against them would deadlock: its successor's bound comes from
-            # its own earliest end)
-            first = {}
-            for j, t in lb.items():
-                first[session[j]] = min(first.get(session[j], t), t)
-            others = lambda s: min([t for s2, t in first.items() if s2 != s], default=float("inf"))
-            newly = [j for j in started if j not in finished and vals[j]["end"] <= others(session[j])]
-            # Two overlapping sessions can block each other: each one's next turn may (by its bound) start before the
-            # other's running request ends, so neither finishes and the frontier stalls on a committed request that
-            # can't start. Then compare against solved starts instead, and failing that finish the running request
-            # that ends first. A later request can then wait for it, but only on its cache.
-            if not newly and min(lb, key=lambda j: (lb[j], j)) in committed - started:
-                est = {j: vals[j]["start"] if j in vals else t for j, t in lb.items()}
-                first2 = {}
-                for j, t in est.items():
-                    first2[session[j]] = min(first2.get(session[j], t), t)
-                newly = [j for j in started if j not in finished and vals[j]["end"] <= min(
-                    [t for s2, t in first2.items() if s2 != session[j]], default=float("inf"))]
-                running = [j for j in started if j not in finished]
-                if not newly and running:
-                    newly = [min(running, key=lambda j: (vals[j]["end"], j))]
-            # Record the finished requests' interference on the committed requests they overlapped
-            # (finished_interference). Only started ones keep it; see where the window's context is built
-            if last is not None and newly:
-                index, lv, ls = last
-                for u in committed:
-                    if u in finished or u in newly:
-                        continue
-                    d, x, a = finished_interference.get(u, (0, 0, False))
-                    for f in newly:
-                        # (CHANGED for P-D split: f and u can share a cache through either phase; terms are 0 when
-                        # they share none)
-                        if (not split and vals[f]["route"] != vals[u]["route"]) or f not in index or u not in index:
-                            continue
-                        fu, uu = index[f], index[u]
-                        for key in (("dd", uu, fu), ("pd", fu, uu)):
-                            if key in lv["pair_terms"]:
-                                coef, var = lv["pair_terms"][key]
-                                d += coef * ls.Value(var)
-                        if ("dp", fu, uu) in lv["pair_terms"]:
-                            coef, var = lv["pair_terms"]["dp", fu, uu]
-                            x += coef * ls.Value(var)
-                            a = a or bool(ls.Value(var))
-                    finished_interference[u] = (d, x, a)
-            for f in newly:
-                finished.add(f)
-                r, d = vals[f]["route"], vals[f].get("droute", vals[f]["route"])
-                # NEW (P-D split): a split request is done on its prefill cache at its prefill end
-                cache_free_at[r] = max(cache_free_at.get(r, 0), vals[f]["end"] if r == d else vals[f]["prefill_end"])
-                cache_free_at[d] = max(cache_free_at.get(d, 0), vals[f]["end"])
-                finished_interference.pop(f, None)
-            # A committed request's start is fixed once its predecessor is finished: before that, new requests may slow
-            # the predecessor, and a fixed start would leave them waiting until it ends
-            started |= {j for j in committed if trace[j].prev is None or trace[j].prev in finished}
-            if not newly and len(started) == size_started:
-                break
-        # Add requests released within `lookahead` of the frontier (at least one, so the solve always advances).
-        # Without it, later sessions' first turns fill the window and are committed far ahead of the frontier, and
-        # sit in the window until it catches up.
-        near = sorted((j for j in pool if rel[j] <= T + lookahead), key=lambda j: (rel[j], j))
-        new = near[:max(0, window - len(uncommitted))]
-        if not new and not uncommitted:
+        pool = [j for j in range(N) if j not in solved_vars and (trace[j].prev is None or trace[j].prev in solved_vars)]
+        # release time of each request in the pool
+        rel = {j: trace[j].arrival if trace[j].prev is None else solved_vars[trace[j].prev]["end"] + trace[j].think
+               for j in pool}
+
+        # If all requests have been committed, return the schedule
+        if not pool and not state.uncommitted:
+            return solved_vars
+
+
+        # `advance_states` updates the `RollingState` state from the previous window to the current one.
+        time_frontier = advance_states(state, trace, info, pool, step_latency, blk_size, split)
+        # time_frontier: the earliest time (ms) at which any request whose start isn't fixed yet can start. 
+        # This moves ahead as requests start and finish.
+        # The number of requests in the sliding window is limited both by `window_size`
+        # and the time lookahead from this frontier (`window_lookahead_time_limit`).
+
+        # Add requests released within `window_lookahead_time_limit` of the frontier.
+        # Without it, later sessions' first turns fill the window and are committed far ahead of the
+        # frontier, and sit in the window until it catches up.
+        near = sorted((j for j in pool if rel[j] <= time_frontier + window_lookahead_time_limit),
+                      key=lambda j: (rel[j], j))
+        new = near[:max(0, window_size - len(state.uncommitted))]
+        # add atleast one new request in the window, if the window is empty.
+        # ensure progress
+        if not new and not state.uncommitted:
             new = sorted(pool, key=lambda j: (rel[j], j))[:1]
-        if inspect is not None:
-            inspect.append(dict(lb=dict(lb), first=dict(first), session=session, started=set(started),
-                                committed=set(committed), finished=set(finished), vals={j: dict(x) for j, x in vals.items()}))
-        active = sorted((committed - finished) | set(uncommitted) | set(new))
-        index = {g: l for l, g in enumerate(active)}
+        # Requests that are going to be solved in the current window
+        active = sorted((state.committed - state.finished) | set(state.uncommitted) | set(new))
 
-        # The window's trace and context
-        local, ctx = [], Context()
-        for g in active:
-            u = trace[g]
-            if u.prev is None or u.prev in index:
-                local.append(Request(u.isl, u.osl, u.arrival, u.hash_ids, index.get(u.prev), u.think))
-            else:
-                local.append(Request(u.isl, u.osl, vals[u.prev]["end"] + u.think, u.hash_ids, None, 0))
-            l = index[g]
-            # One cache-hit source among finished requests: the one already chosen, else the largest hit (the
-            # session's latest prompt, in practice)
-            ext = [(t, i) for i, t in sources[g] if i in finished]
-            if g in vals and vals[g]["src"] in finished:
-                ext = [(t, i) for t, i in ext if i == vals[g]["src"]]
-            if ext:
-                t, i = max(ext)
-                ctx.finished_hit_sources[l] = (i, vals[i]["prefill_end"], vals[i]["route"], vals[i]["end"], t, size[i])
-            # A request that isn't started has to start after the finished requests on its cache end (cache_free_at), so
-            # it won't overlap them: drop what it overlapped them by in the last solve (nonzero only after a forced
-            # finish). A started one keeps its start, and so its overlaps.
-            if g in finished_interference and g not in started:
-                del finished_interference[g]
-            if g in finished_interference:
-                ctx.finished_interference[l] = finished_interference[g]
-            if g in committed:
-                src = vals[g]["src"]
-                ctx.committed_route_and_hit[l] = (vals[g]["route"],
-                                                  index[src] if src in index else "ext" if src is not None else None)
-                if split:
-                    ctx.committed_droute[l] = vals[g]["droute"]
-            if g in started:
-                ctx.fixed_start[l] = vals[g]["start"]
-            elif cache_free_at:
-                ctx.cache_free_at[l] = dict(cache_free_at)
-        T0 = min([vals[g]["start"] for g in active if g in vals] + [rel[j] for j in new])
-        for f in finished:
-            if vals[f]["prefill_end"] > T0:
-                ctx.finished_prefills.append((vals[f]["route"], vals[f]["start"], vals[f]["prefill_end"]))
-            r, d = vals[f]["route"], vals[f].get("droute", vals[f]["route"])
-            if vals[f]["end"] > T0 and r == d:
-                ctx.finished_kv_lifetimes.append((r, vals[f]["start"], vals[f]["end"], trace[f].isl + trace[f].osl))
-            elif vals[f]["end"] > T0:
-                # NEW (P-D split): the decode cache holds it from the prefill end, the prefill cache until the transfer
-                ctx.finished_kv_lifetimes.append((d, vals[f]["prefill_end"], vals[f]["end"],
-                                                  trace[f].isl + trace[f].osl))
-                if vals[f]["decode_start"] > T0:
-                    ctx.finished_kv_lifetimes.append((r, vals[f]["start"], vals[f]["decode_start"], trace[f].isl))
+        # Build the window's trace and `Context` that will be passed to build model
+        local_trace, ctx, global_index_to_local_index = build_window_context(state, trace, info, active, new, rel,
+                                                                             split, Context())
 
-        # Complete hint: previous decisions, else follow the cache-hit source, else the least busy cache
-        # (NEW (P-D split): decode caches from previous decisions, else colocated; with pools, prefills go to the
-        # least busy prefill cache and decodes stay there if it's also a decode cache, else go to the least busy one)
-        route, src, running, drunning = [], [], [0] * C, [0] * C
-        droute = [vals[g]["droute"] if g in vals else None for g in active] if split else None
-        prefill_pool, decode_pool = pools or (range(C), range(C))
+        # Hint: the window's routing (previous decisions, else follow the cache-hit source, else the least busy cache)
+        # and the previous windows' starts; CP-SAT finds everything else
+        partial_hint = get_cache_routing_partial_hint(state, info, active, global_index_to_local_index, ctx, C, split,
+                                                      pools)
+        model, v = build_model(local_trace, blk_size, C, mem, horizon, step_latency, ctx=ctx, topology=topology,
+                               pools=pools)
         for g in active:
-            if g in vals:
-                running[vals[g]["route"]] += 1
-                drunning[vals[g].get("droute", vals[g]["route"])] += 1
-        for g in active:
-            l = index[g]
-            if g in vals:
-                s = vals[g]["src"]
-                route.append(vals[g]["route"])
-                src.append(index[s] if s in index else "ext" if s is not None and l in ctx.finished_hit_sources else None)
-            else:
-                cands = [(t, i) for i, t in sources[g] if i in index]
-                if cands:
-                    i = max(cands)[1]
-                    route.append(route[index[i]])
-                    src.append(index[i])
-                elif l in ctx.finished_hit_sources:
-                    route.append(ctx.finished_hit_sources[l][2])
-                    src.append("ext")
-                else:
-                    route.append(min(prefill_pool, key=lambda c: running[c]))
-                    src.append(None)
-                running[route[-1]] += 1
-        if split:
-            for l, r in enumerate(route):
-                if droute[l] is None:
-                    droute[l] = r if r in decode_pool else min(decode_pool, key=lambda c: drunning[c])
-                    drunning[droute[l]] += 1
-        hint, _ = full_hint(local, blk_size, C, mem, horizon, route, src, steps, ctx=ctx, droute=droute, pools=pools)
-        if hint is None:
-            # Always feasible: the previous window's starts, and new requests after everything on their cache, so
-            # they slow nothing down
-            free, starts, ends = {}, [0] * len(active), [0] * len(active)
-            for g in active:
-                if g in vals:
-                    for c in {vals[g]["route"], vals[g].get("droute", vals[g]["route"])}:
-                        free[c] = max(free.get(c, 0), vals[g]["end"])
-            for g in sorted(active, key=lambda g: (g not in vals, rel.get(g, 0), g)):
-                l = index[g]
-                if g in vals:
-                    starts[l] = vals[g]["start"]
-                    continue
-                u = local[l]
-                r = u.arrival if u.prev is None else None
-                if r is None:
-                    p = active[u.prev]
-                    r = (vals[p]["end"] if p in vals else ends[u.prev]) + u.think
-                c = route[l]
-                d = droute[l] if split else c
-                starts[l] = max(r, free.get(c, 0), free.get(d, 0), *ctx.cache_free_at.get(l, {}).values()) + 1
-                h = ctx.finished_hit_sources[l][4] if src[l] == "ext" else shared_tokens(local[src[l]], u, blk_size) if src[l] is not None else 0
-                e = starts[l] + steps(u.isl, h, blk_size) + ceil(u.osl * (steps.f1 + steps.k * (u.isl + u.osl)) + 1)
-                if d != c:
-                    # NEW (P-D split): the transfer and the extra decode step
-                    e += transfer_ms(u.isl, steps.f1 + steps.k * (u.isl + u.osl)) + ceil(steps.f1 + steps.k * (u.isl + u.osl))
-                free[c] = max(free.get(c, 0), e)
-                free[d] = max(free.get(d, 0), e)
-                ends[l] = e
-            hint, _ = full_hint(local, blk_size, C, mem, horizon, route, src, steps, ctx=ctx, starts=starts,
-                                droute=droute, pools=pools)
-        model, v = build_model(local, blk_size, C, mem, horizon, steps, ctx=ctx, topology=topology, pools=pools)
-        for i, x in enumerate(hint or []):
-            model.AddHint(model.get_int_var_from_proto_index(i), x)
-        if hint is None:
-            for g in active:
-                if g in vals:
-                    model.AddHint(v["starts"][index[g]], vals[g]["start"])
-                model.AddHint(v["routes"][index[g]][route[index[g]]], 1)
-                if split:
-                    model.AddHint(v["droutes"][index[g]][droute[index[g]]], 1)
+            l = global_index_to_local_index[g]
+            if g in solved_vars:
+                model.AddHint(v["starts"][l], solved_vars[g]["start"])
+            model.AddHint(v["routes"][l][partial_hint.route[l]], 1)
+            if split:
+                model.AddHint(v["droutes"][l][partial_hint.droute[l]], 1)
+
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = limit
+        solver.parameters.max_time_in_seconds = window_solving_time_limit
         status = solver.Solve(model)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             raise RuntimeError(f"window of {len(active)} requests: {solver.StatusName(status)}")
         obj, bound = solver.ObjectiveValue(), solver.BestObjectiveBound()
         V = solver.Value
+
         for g in active:
-            l = index[g]
+            l = global_index_to_local_index[g]
             s = next((active[i] for i in range(len(active)) if V(v["reuses"][i][l])), None)
             if s is None and l in v["ext_reuses"] and V(v["ext_reuses"][l]):
                 s = ctx.finished_hit_sources[l][0]
             r = v["releases"][l]
-            vals[g] = dict(route=next(c for c in range(C) if V(v["routes"][l][c])), start=V(v["starts"][l]), src=s,
-                           prefill_slowdown=V(v["prefill_slowdowns"][l]), decode=V(v["decodes"][l]),
-                           prefill_end=V(v["prefill_ends"][l]),
-                           end=V(v["ends"][l]), release=r if isinstance(r, int) else V(r))
+            solved_vars[g] = dict(route=next(c for c in range(C) if V(v["routes"][l][c])), start=V(v["starts"][l]),
+                                  src=s, prefill_slowdown=V(v["prefill_slowdowns"][l]), decode=V(v["decodes"][l]),
+                                  prefill_end=V(v["prefill_ends"][l]),
+                                  end=V(v["ends"][l]), release=r if isinstance(r, int) else V(r))
             if split:
-                vals[g] |= dict(droute=next(c for c in range(C) if V(v["droutes"][l][c])),
-                                decode_start=V(v["decode_starts"][l]))
-        last = (index, v, solver)
-        # Commit (cache and cache hit) the uncommitted requests that start first; with nothing left to add, commit
-        # everything
-        pending = sorted(uncommitted + new, key=lambda j: (vals[j]["start"], j))
-        more = any(j not in vals for j in range(N))
+                solved_vars[g] |= dict(droute=next(c for c in range(C) if V(v["droutes"][l][c])),
+                                       decode_start=V(v["decode_starts"][l]))
+        state.last_window_state = (global_index_to_local_index, v, solver)
+        # Commit the uncommitted requests that start first.
+        # If with no new requests left to add, commit everything
+        pending = sorted(state.uncommitted + new, key=lambda j: (solved_vars[j]["start"], j))
+        more = any(j not in solved_vars for j in range(N))
         if more:
-            # Within half the lookahead of the frontier, at least one
-            commit = [j for j in pending if vals[j]["start"] <= T + lookahead / 2][:step] or pending[:1]
+            # Commit window_step no of requests within half of window_lookahead_time_limit of the frontier.
+            # atleast one request is always committed to ensure progress
+            commit = [j for j in pending
+                      if solved_vars[j]["start"] <= time_frontier + window_lookahead_time_limit / 2][:window_step] \
+                or pending[:1]
         else:
             commit = pending
-        committed |= set(commit)
-        uncommitted = [j for j in pending if j not in committed]
-        log(f"Window at {T / 1000:.0f} s: {len(active)} requests ({len(new)} new, {len(active) - len(pending)} committed), "
-            f"{solver.StatusName(status)} in {solver.WallTime():.1f} s, gap {(obj - bound) / max(obj, 1):.1%}"
-            + ("" if hint else ", no complete hint") + f"; {len(vals)}/{N} solved")
-        if not more and not uncommitted:
-            return vals
+        state.committed |= set(commit)
+        state.uncommitted = [j for j in pending if j not in state.committed]
+        log(f"Window at {time_frontier / 1000:.0f} s: {len(active)} requests ({len(new)} new, "
+            f"{len(active) - len(pending)} committed), {solver.StatusName(status)} in {solver.WallTime():.1f} s, "
+            f"gap {(obj - bound) / max(obj, 1):.1%}; {len(solved_vars)}/{N} solved")
+        if not more and not state.uncommitted:
+            return solved_vars

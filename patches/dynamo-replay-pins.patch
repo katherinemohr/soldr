@@ -1,0 +1,179 @@
+Pin offline-replay requests to specific workers in Dynamo's Mocker (KV router mode).
+
+DYN_REPLAY_PINS names a JSON file {"aggregated": {request_id: worker}, "prefill": {...}, "decode": {...}};
+the KV router then places each listed request on that worker instead of selecting one. Request IDs come
+from agentic-format traces (Mooncake rows have none). pd_packing.run_mocker_pd writes the file.
+
+Against ai-dynamo de80aabb58a96a0424b68ce9d1b83b7c59552800 (the requirements.txt pin). To build:
+    git clone https://github.com/ai-dynamo/dynamo && cd dynamo && git checkout de80aabb58a96a0424b68ce9d1b83b7c59552800
+    git apply /path/to/soldr/patches/dynamo-replay-pins.patch
+    cd lib/bindings/python && uvx --from 'maturin>=1.0,<2.0' maturin build --release --features ais-forward-pass \
+        -i /path/to/soldr/.venv/bin/python -o dist
+    uv pip install --python /path/to/soldr/.venv/bin/python --no-deps --reinstall dist/ai_dynamo_runtime-*.whl
+
+diff --git a/lib/mocker/src/replay/offline/extensions/kv_router/composition.rs b/lib/mocker/src/replay/offline/extensions/kv_router/composition.rs
+index f49a55ead..95d153317 100644
+--- a/lib/mocker/src/replay/offline/extensions/kv_router/composition.rs
++++ b/lib/mocker/src/replay/offline/extensions/kv_router/composition.rs
+@@ -9,13 +9,34 @@ use aisimulate_core::replay::{
+ };
+ use anyhow::{Context, Result, bail};
+ use dynamo_kv_router::config::{KvRouterConfig, RouterPrefillLoadModel};
+-use std::collections::HashSet;
++use dynamo_kv_router::protocols::WorkerId;
++use std::collections::{HashMap, HashSet};
+ 
+ use super::{KvReplayMetadata, KvRouterPlacement};
+ use crate::common::protocols::MockerConfig;
+ use crate::replay::ReplayPrefillLoadEstimator;
+ use crate::replay::offline::extensions::kv_events::RouterEventObservation;
+ 
++/// Workers that KV Router placement must use, keyed by trace request ID, read from the JSON file named by
++/// `DYN_REPLAY_PINS`: `{"aggregated": {id: worker}, "prefill": {...}, "decode": {...}}`. Only agentic traces
++/// carry request IDs. Requests without a pin are routed as usual.
++#[derive(Default, serde::Deserialize)]
++#[serde(default, deny_unknown_fields)]
++struct ReplayPins {
++    aggregated: HashMap<String, WorkerId>,
++    prefill: HashMap<String, WorkerId>,
++    decode: HashMap<String, WorkerId>,
++}
++
++fn replay_pins() -> Result<ReplayPins> {
++    let Ok(path) = std::env::var("DYN_REPLAY_PINS") else {
++        return Ok(ReplayPins::default());
++    };
++    let file = std::fs::File::open(&path).with_context(|| format!("opening DYN_REPLAY_PINS {path}"))?;
++    serde_json::from_reader(std::io::BufReader::new(file))
++        .with_context(|| format!("parsing DYN_REPLAY_PINS {path}"))
++}
++
+ /// Round-robin placement with an optional Dynamo Planner scaling policy.
+ pub(in crate::replay) struct RoundRobinReplayComposition {
+     scaling_policy: Option<Box<dyn ReplayScalingPolicy>>,
+@@ -184,7 +205,8 @@ impl ReplayComposition for KvReplayComposition {
+             topology.len(),
+             self.determinism.selector_seed(),
+         )?
+-        .with_kv_event_lag_ms(self.kv_event_lag_ms)
++        .with_kv_event_lag_ms(self.kv_event_lag_ms)?
++        .with_pins(replay_pins()?.aggregated)
+     }
+ 
+     fn create_disaggregated_placements(
+@@ -218,6 +240,7 @@ impl ReplayComposition for KvReplayComposition {
+             &decode_topology,
+         )?;
+         let router_config = self.router_config.take();
++        let pins = replay_pins()?;
+         let prefill = KvRouterPlacement::new_with_selector_seed(
+             prefill_args,
+             Some(derive_prefill_router_config(
+@@ -229,7 +252,8 @@ impl ReplayComposition for KvReplayComposition {
+             self.determinism.selector_seed(),
+         )
+         .context("constructing prefill KV Router placement")?
+-        .with_kv_event_lag_ms(self.kv_event_lag_ms)?;
++        .with_kv_event_lag_ms(self.kv_event_lag_ms)?
++        .with_pins(pins.prefill)?;
+         let decode = KvRouterPlacement::new_with_selector_seed(
+             decode_args,
+             Some(derive_decode_router_config(decode_args, router_config)),
+@@ -238,7 +262,8 @@ impl ReplayComposition for KvReplayComposition {
+             self.determinism.selector_seed(),
+         )
+         .context("constructing decode KV Router placement")?
+-        .with_kv_event_lag_ms(self.kv_event_lag_ms)?;
++        .with_kv_event_lag_ms(self.kv_event_lag_ms)?
++        .with_pins(pins.decode)?;
+         Ok((prefill, decode))
+     }
+ 
+diff --git a/lib/mocker/src/replay/offline/extensions/kv_router/mod.rs b/lib/mocker/src/replay/offline/extensions/kv_router/mod.rs
+index 388d983eb..1627c5f52 100644
+--- a/lib/mocker/src/replay/offline/extensions/kv_router/mod.rs
++++ b/lib/mocker/src/replay/offline/extensions/kv_router/mod.rs
+@@ -363,6 +363,8 @@ struct PendingRequest {
+     strict_priority: u32,
+     policy_class: Option<String>,
+     session_id: Option<String>,
++    /// Worker this request must be placed on, from the replay's pin map.
++    pinned_worker: Option<WorkerWithDpRank>,
+ }
+ 
+ impl PendingRequest {
+@@ -398,7 +400,7 @@ impl PendingRequest {
+                 .map(|session_id| SessionContext::new(session_id, None, None, None)),
+             expected_output_tokens: self.expected_output_tokens,
+             affinity_target: None,
+-            pinned_worker: None,
++            pinned_worker: self.pinned_worker,
+             allowed_worker_ids: None,
+             routing_constraints: RoutingConstraints::default(),
+             shared_cache_hits: None,
+@@ -426,6 +428,8 @@ pub(crate) struct OfflineReplayRouter {
+     kv_event_lag_ms: f64,
+     /// Lagged KV event batches in arrival order, keyed by the replay time they become visible.
+     lagged_kv_events: VecDeque<(f64, Vec<RouterEvent>)>,
++    /// Trace request ID -> worker that must serve it, bypassing worker selection.
++    pins: HashMap<String, WorkerId>,
+ }
+ 
+ pub(in crate::replay) struct KvRouterPlacement {
+@@ -460,6 +464,11 @@ impl KvRouterPlacement {
+         Ok(self)
+     }
+ 
++    pub(in crate::replay) fn with_pins(mut self, pins: HashMap<String, WorkerId>) -> Result<Self> {
++        self.router.set_pins(pins)?;
++        Ok(self)
++    }
++
+     fn placement(&self, admission: WorkerAdmission) -> Placement {
+         Placement {
+             request_id: admission.uuid,
+@@ -670,9 +679,24 @@ impl OfflineReplayRouter {
+             tracking_hash,
+             kv_event_lag_ms: 0.0,
+             lagged_kv_events: VecDeque::new(),
++            pins: HashMap::new(),
+         })
+     }
+ 
++    pub(crate) fn set_pins(&mut self, pins: HashMap<String, WorkerId>) -> Result<()> {
++        if let Some((request_id, worker_id)) = pins
++            .iter()
++            .find(|(_, worker_id)| !self.workers_with_configs.contains_key(worker_id))
++        {
++            return Err(anyhow!(
++                "request {request_id} is pinned to worker {worker_id}, but the pool has {} workers",
++                self.workers_with_configs.len()
++            ));
++        }
++        self.pins = pins;
++        Ok(())
++    }
++
+     pub(crate) fn set_kv_event_lag_ms(&mut self, lag_ms: f64) -> Result<()> {
+         if !lag_ms.is_finite() || lag_ms < 0.0 {
+             return Err(anyhow!(
+@@ -985,6 +1009,11 @@ impl OfflineReplayRouter {
+         let uuid = request
+             .uuid
+             .ok_or_else(|| anyhow!("offline replay requires requests to have stable UUIDs"))?;
++        let pinned_worker = request
++            .replay_context
++            .as_ref()
++            .and_then(|context| self.pins.get(&context.authored_id))
++            .map(|&worker_id| WorkerWithDpRank::new(worker_id, 0));
+         let (priority_jump, strict_priority) = request.router_priorities();
+         let (tiered, token_seq) = match replay_hashes {
+             Some(replay_hashes) => {
+@@ -1045,6 +1074,7 @@ impl OfflineReplayRouter {
+             strict_priority,
+             policy_class: request.policy_class.clone(),
+             session_id,
++            pinned_worker,
+         })
+     }
+ 
