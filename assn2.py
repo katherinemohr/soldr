@@ -20,7 +20,8 @@ from math import ceil
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-ASSN2 = os.path.normpath(os.path.join(HERE, "..", "cs349e-assn2"))
+from assn2_dir import assn2_dir
+ASSN2 = assn2_dir()
 CONFIG = "qwen3-8b_a100x4"
 BLK = 64                       # block size for the solver's hash ids; no two assn2 prompts share a block
 WORKERS = 4

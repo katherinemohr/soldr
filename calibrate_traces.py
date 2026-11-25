@@ -14,7 +14,8 @@
 import argparse, json, os, statistics, sys, time
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-ASSN2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cs349e-assn2")
+from assn2_dir import assn2_dir
+ASSN2 = assn2_dir()
 TRACES = {"chat": (722, 185, 96), "summarize": (1651, 90, 48), "extract": (4000, 25, 24)}   # isl, osl, slots
 B_GRID = (1, 2, 3, 4, 6, 8, 10, 12, 16, 20, 24, 28, 32, 40, 48, 56, 64, 80, 96)
 WARMUP, STEPS, EVENT_REPS = 3, 20, 5

@@ -1,0 +1,3 @@
+[submodule "cs349e-assn2"]
+	path = cs349e-assn2
+	url = git@code.stanford.edu:kgmohr/cs349e-assn2.git

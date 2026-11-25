@@ -18,7 +18,8 @@ import argparse, json, os, statistics, sys, time
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")   # as run_experiment.py
 import numpy as np
 
-ASSN2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "cs349e-assn2")
+from assn2_dir import assn2_dir
+ASSN2 = assn2_dir()
 DECODE_L = (512, 722, 1651, 2048, 4000, 6000)
 DECODE_B = (1, 2, 4, 8, 16, 24, 32, 48, 64, 96)
 MAX_DECODE_TOKENS = 120_000          # B * L cap (~17.7 GB of KV) so a 40 GB A100 never OOMs
