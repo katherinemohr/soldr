@@ -177,15 +177,17 @@ def solve(args):
     step = args.step or window
     print(f"{args.trace} r{args.rate:g} seed {args.seed}: {N} requests, topology {args.topology}; "
           f"window {window}, step {step}, {args.limit:g} s per window", flush=True)
-    policy = None
-    if args.policy == "rr":
+    policy = warm = None
+    if args.policy in ("rr", "warm"):
         # Controller._dispatch_loop: prefill rank rid % P, decode rank rid % D, dispatched on arrival, FCFS per worker
         P, D = len(prefill_ranks), len(decode_ranks)
-        policy = lambda g: (prefill_ranks[g % P], decode_ranks[g % D], g - P if g >= P else None)
+        rr = lambda g: (prefill_ranks[g % P], decode_ranks[g % D], g - P if g >= P else None)
+        # warm optimizes from the round-robin solution, so it must share rr's model (decodes may wait for a slot)
+        policy, warm = (rr, None) if args.policy == "rr" else (None, rr)
         interference_packing.DECODE_MAY_WAIT = True
     t = time.time()
     vals = solve_rolling(trace, BLK, WORKERS, mem, window, step, args.limit,
-                         step_latency=steps, topology=solver_topology, pools=pools, policy=policy, log=lambda s: print(" ", s, flush=True))
+                         step_latency=steps, topology=solver_topology, pools=pools, policy=policy, warm_policy=warm, log=lambda s: print(" ", s, flush=True))
     solve_s = time.time() - t
 
     reqs = []
@@ -320,8 +322,11 @@ def rank(args):
         if os.path.exists(sp.replace(".json", "_rr.json")):
             r_ = json.load(open(sp.replace(".json", "_rr.json")))
             out["pred_rr"] = [(r["pred"]["ttft_ms"], r["pred"]["tpot_ms"], r["pred"]["e2e_ms"]) for r in r_["requests"]]
-        for arm in ("sched", "rr"):
-            p = os.path.join(res, f"{arm}_{name}.jsonl")
+        if os.path.exists(sp.replace(".json", "_warm.json")):
+            r_ = json.load(open(sp.replace(".json", "_warm.json")))
+            out["pred_warm"] = [(r["pred"]["ttft_ms"], r["pred"]["tpot_ms"], r["pred"]["e2e_ms"]) for r in r_["requests"]]
+        for arm, fn in (("sched", f"sched_{name}"), ("rr", f"rr_{name}"), ("warm", f"sched_{name}_warm")):
+            p = os.path.join(res, fn + ".jsonl")
             if os.path.exists(p):
                 _, recs = load_results(p)
                 out[arm] = [(r["ttft"] * 1e3, r["tpot"] * 1e3, (r["done_t"] - r["arrival_t"]) * 1e3) for r in recs.values()]
@@ -336,7 +341,7 @@ def rank(args):
     print(f"  {'topology':10s} {'':10s} {'SLO %':>6s} {'TTFT p90':>9s} {'TPOT p90':>9s} {'mean e2e':>9s}")
     best = {}
     for topo, out in rows.items():
-        for arm in ("predicted", "sched", "pred_rr", "rr"):
+        for arm in ("predicted", "sched", "pred_rr", "rr", "pred_warm", "warm"):
             if arm in out:
                 ok, t90, p90, e2e = stats(out[arm])
                 best.setdefault(arm, []).append(((-ok, e2e), topo))
@@ -360,8 +365,8 @@ if __name__ == "__main__":
     a.add_argument("--limit", type=float, default=30, help="CP-SAT seconds per window")
     a.add_argument("--out", default=None)
     a.add_argument("--any-rate", action="store_true")
-    a.add_argument("--policy", choices=("opt", "rr"), default="opt",
-                   help="opt: optimize routing and starts; rr: predict the harness's round robin (writes <name>_rr.json)")
+    a.add_argument("--policy", choices=("opt", "rr", "warm"), default="opt",
+                   help="opt: optimize routing and starts; rr: predict the harness's round robin (writes <name>_rr.json); warm: optimize starting from the round-robin solution (<name>_warm.json)")
     v = sub.add_parser("convert")
     v.add_argument("--n", type=int, default=300)
     v.add_argument("--seed", type=int, default=1234)

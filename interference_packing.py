@@ -634,10 +634,12 @@ def get_cache_routing_partial_hint(state, info, active, index, ctx, C, split, po
 
 def solve_rolling(trace, blk_size, C, mem, window_size, window_step, window_solving_time_limit,
                   step_latency=default_steps, horizon=None, window_lookahead_time_limit=30_000, log=print,
-                  topology="colocated", pools=None, policy=None):
+                  topology="colocated", pools=None, policy=None, warm_policy=None):
     # policy: None optimizes routing and starts. A fixed policy instead pins them and the solver only predicts the
     # outcome: policy(g) -> (prefill cache, decode cache, FCFS predecessor on that prefill cache or None). Each request
     # then starts at max(release, predecessor's prefill end): dispatched on arrival, served FCFS, never held.
+    # warm_policy: optimize, but first solve the window under this fixed policy and hint every variable with that
+    # solution, so the window's result is never worse (by the model) than following the policy.
     N = len(trace)
     split = topology == "split"
 
@@ -694,7 +696,7 @@ def solve_rolling(trace, blk_size, C, mem, window_size, window_step, window_solv
                                                       pools)
         model, v = build_model(local_trace, blk_size, C, mem, horizon, step_latency, ctx=ctx, topology=topology,
                                pools=pools)
-        if policy is not None:
+        def pin(model, v, policy):
             for g in active:
                 l = global_index_to_local_index[g]
                 r, d, pred = policy(g)
@@ -708,17 +710,45 @@ def solve_rolling(trace, blk_size, C, mem, window_size, window_step, window_solv
                     model.AddMaxEquality(v["starts"][l], [rel_l, v["prefill_ends"][global_index_to_local_index[pred]]])
                 else:
                     model.Add(v["starts"][l] == max(rel_l, solved_vars[pred]["prefill_end"]))
-        for g in active:
-            l = global_index_to_local_index[g]
-            if g in solved_vars:
-                model.AddHint(v["starts"][l], solved_vars[g]["start"])
-            model.AddHint(v["routes"][l][partial_hint.route[l]], 1)
-            if split:
-                model.AddHint(v["droutes"][l][partial_hint.droute[l]], 1)
+
+        def hint(model, v):
+            for g in active:
+                l = global_index_to_local_index[g]
+                if g in solved_vars:
+                    model.AddHint(v["starts"][l], solved_vars[g]["start"])
+                model.AddHint(v["routes"][l][partial_hint.route[l]], 1)
+                if split:
+                    model.AddHint(v["droutes"][l][partial_hint.droute[l]], 1)
+
+        if policy is not None:
+            pin(model, v, policy)
+        hint(model, v)
+        warm_obj = None
+        if warm_policy is not None:
+            # Same build, so the same variables in the same order; the policy only adds constraints
+            m0, v0 = build_model(local_trace, blk_size, C, mem, horizon, step_latency, ctx=ctx, topology=topology,
+                                 pools=pools)
+            pin(m0, v0, warm_policy)
+            hint(m0, v0)
+            s0 = cp_model.CpSolver()
+            s0.parameters.max_time_in_seconds = window_solving_time_limit
+            st0 = s0.Solve(m0)
+            if st0 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                assert len(m0.Proto().variables) == len(model.Proto().variables)
+                warm_obj = s0.ObjectiveValue()
+                model.ClearHints()
+                for i in range(len(model.Proto().variables)):
+                    model.AddHint(model.GetIntVarFromProtoIndex(i), s0.Value(m0.GetIntVarFromProtoIndex(i)))
+                log(f"  warm start: policy solution {s0.StatusName(st0)} in {s0.WallTime():.1f} s, objective {warm_obj:.0f}")
+            else:
+                log(f"  warm start: policy window {s0.StatusName(st0)}, optimizing without it")
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = window_solving_time_limit
         status = solver.Solve(model)
+        if warm_obj is not None:
+            log(f"  optimized objective {solver.ObjectiveValue():.0f} vs policy {warm_obj:.0f} "
+                f"({solver.ObjectiveValue() / warm_obj - 1:+.1%})")
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
             raise RuntimeError(f"window of {len(active)} requests: {solver.StatusName(status)}")
         obj, bound = solver.ObjectiveValue(), solver.BestObjectiveBound()
