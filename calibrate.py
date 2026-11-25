@@ -13,11 +13,11 @@ def mocker_engine(p):
             "backend": "vllm", "block_size": p.kv_block, "num_gpu_blocks": p.kv_capacity // p.kv_block,
             "max_num_seqs": 256, "max_num_batched_tokens": p.chunk, "enable_prefix_caching": True,
             "enable_chunked_prefill": True, "max_model_len": p.max_context,
-            "timing_model": {"type": "external", "provider": "aic", "config": p.aic | {
+            "timing_model": {"type": "external", "provider": "aic", "config": {
                 "backend": "vllm",
                 "backend_version": "0.24.0", "worker_type": "aggregated", "gemm_quant_mode": "bfloat16",
                 "fmha_quant_mode": "bfloat16", "kvcache_quant_mode": "bfloat16", "kv_block_size": p.kv_block,
-                "estimation_mode": "op_level"}},
+                "estimation_mode": "op_level"} | p.aic},
         },
         "num_gpu_blocks_is_explicit": True,
     }

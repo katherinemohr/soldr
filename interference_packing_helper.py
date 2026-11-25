@@ -68,7 +68,7 @@ class RollingState:
     #   Some of the their information which is still required is carried in Context.
     finished: set = field(default_factory=set)
 
-    # finished_interference[j] = (decode, prefill_slowdown, any)
+    # finished_interference[j] = (decode, prefill_slowdown, any, decode's P->D part)
     #   for a request j that isn't finished: finished_interference records the interference that finished requests caused on this request j,
     #   This is also passed on as ctx.finished_interference in `Context`
     #       decode  interference time added to j's decode
@@ -141,7 +141,7 @@ def advance_states(state, trace, info, pool, step_latency, blk_size, split):
             for u in committed:
                 if u in finished or u in newly:
                     continue
-                d, x, a = finished_interference.get(u, (0, 0, False))
+                d, x, a, p = finished_interference.get(u, (0, 0, False, 0))
                 for f in newly:
                     # (CHANGED for P-D split: f and u can share a cache through either phase; terms are 0 when
                     # they share none)
@@ -149,15 +149,17 @@ def advance_states(state, trace, info, pool, step_latency, blk_size, split):
                             or u not in index):
                         continue
                     fu, uu = index[f], index[u]
-                    for key in (("dd", uu, fu), ("pd", fu, uu)):
+                    for key in (("dd", uu, fu), ("pd", fu, uu), ("pdev", fu, uu)):
                         if key in lv["pair_terms"]:
                             coef, var = lv["pair_terms"][key]
                             d += coef * ls.Value(var)
+                            if key[0] != "dd":          # the P->D part alone, for the flat decode branch
+                                p += coef * ls.Value(var)
                     if ("dp", fu, uu) in lv["pair_terms"]:
                         coef, var = lv["pair_terms"]["dp", fu, uu]
                         x += coef * ls.Value(var)
                         a = a or bool(ls.Value(var))
-                finished_interference[u] = (d, x, a)
+                finished_interference[u] = (d, x, a, p)
         for f in newly:
             finished.add(f)
             r, d = solved_vars[f]["route"], solved_vars[f].get("droute", solved_vars[f]["route"])

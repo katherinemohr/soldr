@@ -1,0 +1,215 @@
+{
+ "format": "soldr-assn2-schedule/1",
+ "trace": "chat",
+ "rate": 6.333,
+ "seed": 1234,
+ "n_requests": 10,
+ "topology": "colocated",
+ "prefill_ranks": [
+  0,
+  1,
+  2,
+  3
+ ],
+ "decode_ranks": [
+  0,
+  1,
+  2,
+  3
+ ],
+ "solver": {
+  "window": 10,
+  "step": 10,
+  "limit_s": 30.0,
+  "steps_config": "qwen3-8b_a100x4",
+  "solve_s": 30.618632316589355,
+  "dp_scale": 0.5,
+  "steps": {
+   "f1": 43.227604954075446,
+   "s": 0.03640798994200431,
+   "k": 0.0011216570346574343
+  }
+ },
+ "requests": [
+  {
+   "rid": 0,
+   "prompt_len": 722,
+   "output_len": 185,
+   "arrival_s": 0.5360530249288898,
+   "release_ms": 536,
+   "start_ms": 536,
+   "prefill_rank": 3,
+   "decode_rank": 3,
+   "pred": {
+    "prefill_end_ms": 604,
+    "end_ms": 9127,
+    "decode_start_ms": 604,
+    "ttft_ms": 68,
+    "tpot_ms": 46.32065217391305,
+    "e2e_ms": 8591
+   }
+  },
+  {
+   "rid": 1,
+   "prompt_len": 722,
+   "output_len": 185,
+   "arrival_s": 0.6278148383701481,
+   "release_ms": 628,
+   "start_ms": 628,
+   "prefill_rank": 2,
+   "decode_rank": 2,
+   "pred": {
+    "prefill_end_ms": 696,
+    "end_ms": 9017,
+    "decode_start_ms": 696,
+    "ttft_ms": 68,
+    "tpot_ms": 45.22282608695652,
+    "e2e_ms": 8389
+   }
+  },
+  {
+   "rid": 2,
+   "prompt_len": 722,
+   "output_len": 185,
+   "arrival_s": 0.6290022175045733,
+   "release_ms": 629,
+   "start_ms": 629,
+   "prefill_rank": 1,
+   "decode_rank": 1,
+   "pred": {
+    "prefill_end_ms": 697,
+    "end_ms": 9226,
+    "decode_start_ms": 697,
+    "ttft_ms": 68,
+    "tpot_ms": 46.35326086956522,
+    "e2e_ms": 8597
+   }
+  },
+  {
+   "rid": 3,
+   "prompt_len": 722,
+   "output_len": 185,
+   "arrival_s": 1.0109458241483504,
+   "release_ms": 1011,
+   "start_ms": 1011,
+   "prefill_rank": 0,
+   "decode_rank": 0,
+   "pred": {
+    "prefill_end_ms": 1079,
+    "end_ms": 9408,
+    "decode_start_ms": 1079,
+    "ttft_ms": 68,
+    "tpot_ms": 45.266304347826086,
+    "e2e_ms": 8397
+   }
+  },
+  {
+   "rid": 4,
+   "prompt_len": 722,
+   "output_len": 185,
+   "arrival_s": 1.4532797826946084,
+   "release_ms": 1453,
+   "start_ms": 1453,
+   "prefill_rank": 1,
+   "decode_rank": 1,
+   "pred": {
+    "prefill_end_ms": 1544,
+    "end_ms": 10033,
+    "decode_start_ms": 1544,
+    "ttft_ms": 91,
+    "tpot_ms": 46.13586956521739,
+    "e2e_ms": 8580
+   }
+  },
+  {
+   "rid": 5,
+   "prompt_len": 722,
+   "output_len": 185,
+   "arrival_s": 1.5911004723946407,
+   "release_ms": 1591,
+   "start_ms": 1591,
+   "prefill_rank": 3,
+   "decode_rank": 3,
+   "pred": {
+    "prefill_end_ms": 1682,
+    "end_ms": 10170,
+    "decode_start_ms": 1682,
+    "ttft_ms": 91,
+    "tpot_ms": 46.130434782608695,
+    "e2e_ms": 8579
+   }
+  },
+  {
+   "rid": 6,
+   "prompt_len": 722,
+   "output_len": 185,
+   "arrival_s": 1.7669115739690537,
+   "release_ms": 1767,
+   "start_ms": 1767,
+   "prefill_rank": 0,
+   "decode_rank": 0,
+   "pred": {
+    "prefill_end_ms": 1858,
+    "end_ms": 10131,
+    "decode_start_ms": 1858,
+    "ttft_ms": 91,
+    "tpot_ms": 44.96195652173913,
+    "e2e_ms": 8364
+   }
+  },
+  {
+   "rid": 7,
+   "prompt_len": 722,
+   "output_len": 185,
+   "arrival_s": 1.7807551676262559,
+   "release_ms": 1781,
+   "start_ms": 1781,
+   "prefill_rank": 2,
+   "decode_rank": 2,
+   "pred": {
+    "prefill_end_ms": 1872,
+    "end_ms": 10137,
+    "decode_start_ms": 1872,
+    "ttft_ms": 91,
+    "tpot_ms": 44.91847826086956,
+    "e2e_ms": 8356
+   }
+  },
+  {
+   "rid": 8,
+   "prompt_len": 722,
+   "output_len": 185,
+   "arrival_s": 2.0104238154910585,
+   "release_ms": 2010,
+   "start_ms": 2010,
+   "prefill_rank": 3,
+   "decode_rank": 3,
+   "pred": {
+    "prefill_end_ms": 2101,
+    "end_ms": 10525,
+    "decode_start_ms": 2101,
+    "ttft_ms": 91,
+    "tpot_ms": 45.78260869565217,
+    "e2e_ms": 8515
+   }
+  },
+  {
+   "rid": 9,
+   "prompt_len": 722,
+   "output_len": 185,
+   "arrival_s": 2.053096793119342,
+   "release_ms": 2053,
+   "start_ms": 2053,
+   "prefill_rank": 1,
+   "decode_rank": 1,
+   "pred": {
+    "prefill_end_ms": 2144,
+    "end_ms": 10566,
+    "decode_start_ms": 2144,
+    "ttft_ms": 91,
+    "tpot_ms": 45.77173913043478,
+    "e2e_ms": 8513
+   }
+  }
+ ]
+}

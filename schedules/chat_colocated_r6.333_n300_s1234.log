@@ -1,0 +1,22 @@
+chat r6.333 seed 1234: 300 requests, topology colocated; window 16, step 8, 20 s per window
+  Window at 1 s: 16 requests (16 new, 0 committed), FEASIBLE in 20.1 s, gap 5.9%; 16/300 solved
+  Window at 2 s: 24 requests (8 new, 8 committed), FEASIBLE in 20.3 s, gap 9.0%; 24/300 solved
+  Window at 3 s: 31 requests (8 new, 15 committed), FEASIBLE in 20.2 s, gap 15.2%; 32/300 solved
+  Window at 3 s: 38 requests (8 new, 22 committed), FEASIBLE in 20.3 s, gap 19.5%; 40/300 solved
+  Window at 4 s: 45 requests (8 new, 29 committed), FEASIBLE in 20.4 s, gap 18.5%; 48/300 solved
+  Window at 4 s: 52 requests (8 new, 36 committed), FEASIBLE in 20.4 s, gap 16.1%; 56/300 solved
+  Window at 4 s: 60 requests (8 new, 44 committed), FEASIBLE in 20.5 s, gap 13.3%; 64/300 solved
+  Window at 6 s: 67 requests (8 new, 51 committed), FEASIBLE in 20.6 s, gap 13.8%; 72/300 solved
+  Window at 6 s: 75 requests (8 new, 59 committed), FEASIBLE in 20.7 s, gap 12.5%; 80/300 solved
+  Window at 8 s: 82 requests (8 new, 66 committed), FEASIBLE in 20.7 s, gap 12.7%; 88/300 solved
+  Window at 10 s: 89 requests (8 new, 73 committed), FEASIBLE in 20.8 s, gap 7.0%; 96/300 solved
+  Window at 13 s: 96 requests (8 new, 80 committed), FEASIBLE in 20.8 s, gap 8.7%; 104/300 solved
+Traceback (most recent call last):
+  File "/home/team4/kmohr/soldr/assn2.py", line 213, in <module>
+    solve(args)
+  File "/home/team4/kmohr/soldr/assn2.py", line 91, in solve
+    vals = solve_rolling(trace, BLK, WORKERS, p.kv_capacity, window, step, args.limit,
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/team4/kmohr/soldr/interference_packing.py", line 652, in solve_rolling
+    raise RuntimeError(f"window of {len(active)} requests: {solver.StatusName(status)}")
+RuntimeError: window of 103 requests: UNKNOWN

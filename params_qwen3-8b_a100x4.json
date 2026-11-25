@@ -1,0 +1,16 @@
+{
+ "config": "qwen3-8b_a100x4",
+ "decode_ms": 44,
+ "a": 0.06996534802790241,
+ "b": 4.976633174395764e-06,
+ "c": 29.217244262011373,
+ "chunk": 8192,
+ "kv_block": 64,
+ "kv_capacity": 163840,
+ "max_context": 8192,
+ "aic": {
+  "model": "Qwen/Qwen3-8B",
+  "system": "a100_sxm",
+  "backend_version": "0.14.0"
+ }
+}

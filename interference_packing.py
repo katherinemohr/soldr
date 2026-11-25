@@ -11,6 +11,29 @@ from interference_packing_helper import RollingState, advance_states, build_wind
 # Scaling Coefficient Constant used to account for fractional latency steps.
 S = 100
 
+# D->P interference: the fraction of the concurrent decode step each prefill chunk pays. 1.0 for a vLLM-style engine
+# that fuses a chunk and the decodes into one step (Mocker). An engine that runs a prefill alone and pauses the decodes
+# (cs349e-assn2's MIXED mode) only waits for the in-flight decode step, on average half of it: 0.5.
+DP_SCALE = 1.0
+
+# P->D interference: how much of an overlapping prefill a decode loses. Fused (vLLM/Mocker): the chunk joins the decode
+# step, so a decode loses chunk / (chunk + t0) of the overlap. Not fused (cs349e-assn2 MIXED): the prefill runs alone
+# and every decode on the GPU waits for all of it.
+PD_FUSED = True
+
+# Batch-wide stall (ms) each request's arrival and departure cost the decodes on its GPU (cs349e-assn2: admit pads and
+# concatenates the whole batch's KV, evict index_selects and compacts it). Charged to a decode once per later prefill
+# that overlaps it on the same GPU: in steady state that counts one admit and one evict per neighbour.
+EVENT_MS = 0.0
+
+# Hinged decode step (cs349e-assn2's HF engine): a step costs max(FLAT_MS, t0 + delta (B - 1)), flat while launch-bound
+# and linear once the batch's KV copy dominates. With FLAT_MS set, each decode is the larger of the two branches summed
+# over its steps (D-D terms only in the linear one), and a prefill's D->P wait is at least DP_SCALE x FLAT_MS when
+# anything decodes. 0 disables it (one linear branch, as before).
+FLAT_MS = 0.0
+DD_STEP_MS = 0.0
+DECODE_MAY_WAIT = False
+
 # finds the intercept of x on a piecewise linear function defined by xs and ys
 def interp(xs, ys, x):
     # Piecewise linear, extrapolating linearly at both ends
@@ -53,7 +76,7 @@ class StepLatency:
         return max(1, round(self.prefill_ms(isl, min(hit, isl - 1) // blk_size * blk_size)))
 
 
-default_steps = StepLatency("qwen3-30b-a3b_h100x4")
+default_steps = StepLatency("qwen3-8b_a100x4")
 
 
 # Context contains the information about the requests that the solver has
@@ -73,7 +96,7 @@ class Context:
     finished_prefills: list = field(default_factory=list)
     # (route, start, end, size) of finished requests' KV memory that may still overlap the current window.
     finished_kv_lifetimes: list = field(default_factory=list)
-    # finished_interference[j] = (decode, prefill_slowdown, any)
+    # finished_interference[j] = (decode, prefill_slowdown, any, decode's P->D part)
     #   for a started request j: the interference from finished requests it overlaps with is carried over here. 
     #       decode  interference time added to j's decode
     #       prefill_slowdown  interference time added to each of j's prefill chunks
@@ -126,12 +149,16 @@ def constants(trace, blk_size, steps, maxhit):
 
 
 # Constants for KV transfer calculations
-KV_BYTES_PER_TOKEN = 2 * 48 * 4 * 128 * 2       # Qwen3-30B-A3B: 48 layers x 4 KV heads x 128 dims x (K, V) x bf16
-KV_BANDWIDTH_GBPS = 450                         # Mocker's default (H100 NVLink)
+KV_BYTES_PER_TOKEN = 2 * 36 * 8 * 128 * 2       # Qwen3-8B: 36 layers x 8 KV heads x 128 dims x (K, V) x bf16
+KV_BANDWIDTH_GBPS = 300                         # A100 NVLink, one direction (Mocker-style default)
+# Fixed part of a P->D handoff, in ms. None: one decode step (t0). cs349e-assn2 sets it from measurement: the decode
+# worker only polls between steps, so a handoff waits ~1.5 steps, plus its own admit.
+TRANSFER_FIXED_MS = None
 
 
 def transfer_ms(isl, t0):
-    return ceil(isl * KV_BYTES_PER_TOKEN / (KV_BANDWIDTH_GBPS * 1e9) * 1e3 + t0)
+    fixed = t0 if TRANSFER_FIXED_MS is None else TRANSFER_FIXED_MS
+    return ceil(isl * KV_BYTES_PER_TOKEN / (KV_BANDWIDTH_GBPS * 1e9) * 1e3 + fixed)
 
 
 def max_hits(trace, shared, ctx):
@@ -268,14 +295,20 @@ def build_model(trace, blk_size, num_caches, mem, horizon, steps=default_steps, 
                 sizes[c].append(v.isl + v.osl)
         else:
             # (P-D split): the decode starts after the transfer if split
-            model.Add(decode_starts[j] == prefill_ends[j] + q["kv_transfer_time"][j] * splits[j])
+            if DECODE_MAY_WAIT:
+                # a decode worker with no free slot leaves the handoff queued (only for predicting a fixed policy:
+                # the harness admits as soon as it can, so an optimized schedule must not choose to wait)
+                model.Add(decode_starts[j] >= prefill_ends[j] + q["kv_transfer_time"][j] * splits[j])
+            else:
+                model.Add(decode_starts[j] == prefill_ends[j] + q["kv_transfer_time"][j] * splits[j])
             model.Add(ends[j] == decode_starts[j] + decode)
             # Memory: the decode worker holds isl + osl tokens from the start (colocated) or the prefill end
             # to the end; if split, the prefill worker holds the prompt's isl until the
             # transfer is done
             life_start = model.NewIntVar(0, horizon, f"life_start[{j}]")
             model.Add(life_start == starts[j]).OnlyEnforceIf(splits[j].Not())
-            model.Add(life_start == prefill_ends[j]).OnlyEnforceIf(splits[j])
+            # (a handoff queued for a decode slot is still held by the prefill worker: see `held`)
+            model.Add(life_start == (decode_starts[j] if DECODE_MAY_WAIT else prefill_ends[j])).OnlyEnforceIf(splits[j])
             duration = model.NewIntVar(1, horizon, f"duration[{j}]")
             model.Add(duration == ends[j] - life_start)
             held = model.NewIntVar(1, horizon, f"held[{j}]")
@@ -419,11 +452,15 @@ def build_model(trace, blk_size, num_caches, mem, horizon, steps=default_steps, 
                 model.Add(decode_prefill_overlap_len == decode_prefill_overlap_end - overlap_from).OnlyEnforceIf(
                     decoding_prefill_overlap)
                 model.Add(decode_prefill_overlap_len == 0).OnlyEnforceIf(decoding_prefill_overlap.Not())
-                coef = round(S * q["chunk_ms"][b] / (q["chunk_ms"][b] + q["t0"][a]))
+                coef = round(S * q["chunk_ms"][b] / (q["chunk_ms"][b] + q["t0"][a])) if PD_FUSED else S
                 pd_terms[a].append(coef * decode_prefill_overlap_len)
                 pair_terms["pd", b, a] = (coef, decode_prefill_overlap_len)
+                if EVENT_MS:
+                    coef = round(S * EVENT_MS)
+                    pd_terms[a].append(coef * decoding_prefill_overlap)
+                    pair_terms["pdev", b, a] = (coef, decoding_prefill_overlap)
                 # D->P: a's decode part is in each of b's chunk steps
-                coef = round(S * q["delta"][a])
+                coef = round(S * DP_SCALE * q["delta"][a])
                 dp_terms[b].append(coef * decoding_prefill_overlap)
                 decode_prefill_overlaps[b].append(decoding_prefill_overlap)
                 pair_terms["dp", a, b] = (coef, decoding_prefill_overlap)
@@ -441,7 +478,9 @@ def build_model(trace, blk_size, num_caches, mem, horizon, steps=default_steps, 
             for x, y in ((k, j), (j, k)):
                 cap = round(S * q["delta"][y] * min(q["decode_steps"][x], q["decode_steps"][y]))
                 dd_capped = model.NewIntVar(0, cap, f"dd_capped[{x},{y}]")
-                coef = round(S * q["delta"][y] / (q["t0"][x] + q["delta"][y]))
+                # overlap ms -> overlapped steps of x: / (t0 + delta) by default, or / DD_STEP_MS (a typical step at
+                # the operating point) when the step model is hinged and t0 is only the linear branch's intercept
+                coef = round(S * q["delta"][y] / (DD_STEP_MS or (q["t0"][x] + q["delta"][y])))
                 model.AddMinEquality(dd_capped, [coef * decode_decode_overlap_len, cap])
                 decode_decode_interference = model.NewIntVar(0, cap, f"decode_decode_interference[{x},{y}]")
                 model.Add(decode_decode_interference == dd_capped).OnlyEnforceIf(same_dd)
@@ -453,10 +492,22 @@ def build_model(trace, blk_size, num_caches, mem, horizon, steps=default_steps, 
     # in the decode and prefill time variables defined previously.
     for j in range(N):
         # get the interference caused due to finished requests
-        finished_decode, finished_prefill_slowdown, finished_any = ctx.finished_interference.get(j, (0, 0, False))
+        finished_decode, finished_prefill_slowdown, finished_any, finished_pd = \
+            (tuple(ctx.finished_interference.get(j, ())) + (0, 0, False, 0)[len(ctx.finished_interference.get(j, ())):])
         # decode = raw decode time + p-d and d-d interference
         rhs = round(S * q["decode_steps"][j] * q["t0"][j]) + sum(dd_terms[j]) + sum(pd_terms[j]) + finished_decode
         rhs += round(S * q["t0"][j]) * splits[j]
+        if FLAT_MS:
+            # Flat branch: every step costs FLAT_MS, no D-D interference; P->D still applies
+            flat = round(S * q["decode_steps"][j] * FLAT_MS) + sum(pd_terms[j]) + finished_pd
+            flat += round(S * FLAT_MS) * splits[j]
+            lin_v = model.NewIntVar(0, S * horizon, f"decode_lin[{j}]")
+            flat_v = model.NewIntVar(0, S * horizon, f"decode_flat[{j}]")
+            model.Add(lin_v == rhs)
+            model.Add(flat_v == flat)
+            both = model.NewIntVar(0, S * horizon, f"decode_hinge[{j}]")
+            model.AddMaxEquality(both, [lin_v, flat_v])
+            rhs = both
         model.Add(S * decodes[j] >= rhs)
         model.Add(S * decodes[j] <= rhs + S - 1)
         if finished_any:
@@ -467,8 +518,16 @@ def build_model(trace, blk_size, num_caches, mem, horizon, steps=default_steps, 
         else:
             any_decoding = 0
         # prefill time = raw prefill time + d-p interference
-        rhs = q["chunks"][j] * (round(S * (steps.f1 - steps.s)) * any_decoding + sum(dp_terms[j])
+        rhs = q["chunks"][j] * (round(S * DP_SCALE * (steps.f1 - steps.s)) * any_decoding + sum(dp_terms[j])
                                 + finished_prefill_slowdown)
+        if FLAT_MS:
+            lin_v = model.NewIntVar(0, S * horizon, f"pslow_lin[{j}]")
+            model.Add(lin_v == rhs)
+            flat_v = model.NewIntVar(0, S * horizon, f"pslow_flat[{j}]")
+            model.Add(flat_v == q["chunks"][j] * round(S * DP_SCALE * FLAT_MS) * any_decoding)
+            both = model.NewIntVar(0, S * horizon, f"pslow_hinge[{j}]")
+            model.AddMaxEquality(both, [lin_v, flat_v])
+            rhs = both
         model.Add(S * prefill_slowdowns[j] >= rhs)
         model.Add(S * prefill_slowdowns[j] <= rhs + S - 1)
 
@@ -575,7 +634,10 @@ def get_cache_routing_partial_hint(state, info, active, index, ctx, C, split, po
 
 def solve_rolling(trace, blk_size, C, mem, window_size, window_step, window_solving_time_limit,
                   step_latency=default_steps, horizon=None, window_lookahead_time_limit=30_000, log=print,
-                  topology="colocated", pools=None):
+                  topology="colocated", pools=None, policy=None):
+    # policy: None optimizes routing and starts. A fixed policy instead pins them and the solver only predicts the
+    # outcome: policy(g) -> (prefill cache, decode cache, FCFS predecessor on that prefill cache or None). Each request
+    # then starts at max(release, predecessor's prefill end): dispatched on arrival, served FCFS, never held.
     N = len(trace)
     split = topology == "split"
 
@@ -632,6 +694,20 @@ def solve_rolling(trace, blk_size, C, mem, window_size, window_step, window_solv
                                                       pools)
         model, v = build_model(local_trace, blk_size, C, mem, horizon, step_latency, ctx=ctx, topology=topology,
                                pools=pools)
+        if policy is not None:
+            for g in active:
+                l = global_index_to_local_index[g]
+                r, d, pred = policy(g)
+                model.Add(v["routes"][l][r] == 1)
+                if split:
+                    model.Add(v["droutes"][l][d] == 1)
+                rel_l = v["releases"][l]
+                if pred is None:
+                    model.Add(v["starts"][l] == rel_l)
+                elif pred in global_index_to_local_index:
+                    model.AddMaxEquality(v["starts"][l], [rel_l, v["prefill_ends"][global_index_to_local_index[pred]]])
+                else:
+                    model.Add(v["starts"][l] == max(rel_l, solved_vars[pred]["prefill_end"]))
         for g in active:
             l = global_index_to_local_index[g]
             if g in solved_vars:

@@ -14,7 +14,7 @@ class Request:
     prev: int | None = None
     think: int = 0
 
-default_latency = MockerLatency.load("qwen3-30b-a3b_h100x4")
+default_latency = MockerLatency.load("qwen3-8b_a100x4")
 
 def from_mooncake(path, n=None, ms_per_step=default_latency.decode_ms):
     with open(path) as f:
